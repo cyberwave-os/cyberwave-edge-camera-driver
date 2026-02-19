@@ -31,6 +31,16 @@ logging.basicConfig(
 logger = logging.getLogger("camera-driver")
 
 
+def _parse_camera_id(video_device: str) -> int | str:
+    """Parse camera metadata into SDK-compatible camera_id."""
+    # Numeric values from metadata should be treated as local camera indices.
+    # Non-numeric values can be /dev/video* paths, RTSP URLs, etc.
+    try:
+        return int(video_device)
+    except ValueError:
+        return video_device
+
+
 async def main() -> None:
     token = os.getenv("CYBERWAVE_TOKEN")
     twin_uuid = os.getenv("CYBERWAVE_TWIN_UUID")
@@ -44,6 +54,7 @@ async def main() -> None:
 
     is_depth_camera = os.getenv("CYBERWAVE_METADATA_IS_DEPTH_CAMERA", "false").lower() == "true"
     video_device = os.getenv("CYBERWAVE_METADATA_VIDEO_DEVICE", "0")
+    camera_id = _parse_camera_id(video_device)
 
     asset_key = "intel/realsensed455" if is_depth_camera else "cyberwave/standard-cam"
 
@@ -51,7 +62,7 @@ async def main() -> None:
         "Initializing camera driver for twin %s (asset=%s, device=%s)",
         twin_uuid,
         asset_key,
-        video_device,
+        camera_id,
     )
 
     client = Cyberwave(token=token, source_type="edge")
@@ -69,7 +80,7 @@ async def main() -> None:
 
     try:
         logger.info("Starting camera stream for twin %s...", twin_uuid)
-        await camera.start_streaming(device=video_device)
+        await camera.start_streaming(camera_id=camera_id)
         logger.info("Camera stream started. Waiting for shutdown signal...")
         await stop_event.wait()
     except Exception:
