@@ -20,6 +20,7 @@ import asyncio
 import logging
 import os
 import signal
+import subprocess
 import sys
 
 from cyberwave import Cyberwave
@@ -29,6 +30,52 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("camera-driver")
+
+
+def _list_cameras() -> tuple[list[str], list[str]]:
+    """List all available RealSense cameras, like the following:
+    ```bash
+    # List available CV2 cameras
+    python -c "import cv2; [print(f'Camera {i}: {cv2.VideoCapture(i).isOpened()}') for i in range(5)]"
+
+    # List RealSense devices
+    python -c "import pyrealsense2 as rs; ctx = rs.context(); print([d.get_info(rs.camera_info.name) for d in ctx.devices])"
+    ```
+    """
+    # # run sudo chmod 666 /dev/video* to allow non-root users to access the cameras
+    # # use -n so it won't block waiting for a password prompt
+    # subprocess.run("sudo -n chmod 666 /dev/video* >/dev/null 2>&1", shell=True, check=False)
+
+    cv2_cameras: list[str] = []
+    realsense_cameras: list[str] = []
+
+    try:
+        import cv2
+
+        for index in range(10):
+            cap = cv2.VideoCapture(index)
+            try:
+                if cap.isOpened():
+                    cv2_cameras.append(str(index))
+            finally:
+                cap.release()
+    except Exception:
+        logger.exception("Failed to enumerate CV2 cameras")
+
+    try:
+        import pyrealsense2 as rs
+
+        ctx = rs.context()
+        for device in ctx.devices:
+            serial = device.get_info(rs.camera_info.serial_number)
+            if serial:
+                realsense_cameras.append(serial)
+            else:
+                realsense_cameras.append(device.get_info(rs.camera_info.name))
+    except Exception:
+        logger.exception("Failed to enumerate RealSense devices")
+
+    return cv2_cameras, realsense_cameras
 
 
 def _parse_camera_id(video_device: str) -> int | str:
@@ -80,7 +127,29 @@ async def main() -> None:
 
     try:
         logger.info("Starting camera stream for twin %s...", twin_uuid)
-        await camera.start_streaming(camera_id=camera_id)
+        try:
+            await camera.start_streaming(camera_id=camera_id)
+        except Exception:
+            logger.exception(
+                "Camera stream failed with configured device '%s', trying auto-detect fallback",
+                camera_id,
+            )
+            cv2_cameras, realsense_cameras = _list_cameras()
+            fallback_candidates = realsense_cameras if is_depth_camera else cv2_cameras
+            if not fallback_candidates:
+                raise
+
+            fallback_camera_id: int | str
+            if is_depth_camera:
+                fallback_camera_id = fallback_candidates[0]
+            else:
+                fallback_camera_id = _parse_camera_id(fallback_candidates[0])
+
+            logger.info(
+                "Retrying camera stream using auto-detected fallback device '%s'",
+                fallback_camera_id,
+            )
+            await camera.start_streaming(camera_id=fallback_camera_id)
         logger.info("Camera stream started. Waiting for shutdown signal...")
         await stop_event.wait()
     except Exception:
