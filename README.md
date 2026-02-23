@@ -32,6 +32,6 @@ Injected by `cyberwave-edge-core` at runtime:
 
 | Variable                   | Description                                                                                    |
 | -------------------------- | ---------------------------------------------------------------------------------------------- |
-| `CYBERWAVE_TOKEN`          | API token                                                                                      |
+| `CYBERWAVE_API_KEY`          | API token                                                                                      |
 | `CYBERWAVE_TWIN_UUID`      | UUID of the camera twin to stream to                                                           |
 | `CYBERWAVE_TWIN_JSON_FILE` | Path to the twin JSON file (auto-expanded into `CYBERWAVE_METADATA_*` vars by `entrypoint.sh`) |
