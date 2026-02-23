@@ -3,7 +3,7 @@
 Streams a camera feed to a Cyberwave digital twin. Launched by cyberwave-edge-core
 with the following environment variables set:
 
-  CYBERWAVE_TOKEN          – API token
+  CYBERWAVE_API_KEY          – API token
   CYBERWAVE_TWIN_UUID      – UUID of the camera twin to stream to
   CYBERWAVE_TWIN_JSON_FILE – Path to the JSON file describing the twin (expanded
                              into CYBERWAVE_METADATA_* vars by entrypoint.sh)
@@ -42,11 +42,11 @@ def _parse_camera_id(video_device: str) -> int | str:
 
 
 async def main() -> None:
-    token = os.getenv("CYBERWAVE_TOKEN")
+    token = os.getenv("CYBERWAVE_API_KEY")
     twin_uuid = os.getenv("CYBERWAVE_TWIN_UUID")
 
     if not token:
-        logger.error("CYBERWAVE_TOKEN environment variable is required")
+        logger.error("CYBERWAVE_API_KEY environment variable is required")
         sys.exit(1)
     if not twin_uuid:
         logger.error("CYBERWAVE_TWIN_UUID environment variable is required")
