@@ -26,6 +26,26 @@ Set the following fields in the twin or asset metadata to configure the driver:
 | `is_depth_camera` | boolean | `false` | Set to `true` for RGBD/depth cameras (e.g. Intel RealSense D455). |
 | `video_device`    | string  | `"0"`   | `/dev/video*` index or path (e.g. `"0"`, `"/dev/video2"`).        |
 
+## Building with RealSense support
+
+The default image only includes standard USB camera support. To include Intel RealSense (pyrealsense2), build with:
+
+```bash
+docker build --build-arg ENABLE_REALSENSE=true -t cyberwaveos/camera-driver:realsense .
+```
+
+On amd64 this installs pre-built pip wheels; on arm64 it builds librealsense from source (slower build).
+
+Then reference the RealSense image in your asset metadata:
+
+```json
+"drivers": {
+    "default": {
+        "docker_image": "cyberwaveos/camera-driver:realsense"
+    }
+}
+```
+
 ## Environment variables
 
 Injected by `cyberwave-edge-core` at runtime:

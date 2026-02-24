@@ -35,6 +35,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+realsense = [
+    "pyrealsense2>=2.50",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
