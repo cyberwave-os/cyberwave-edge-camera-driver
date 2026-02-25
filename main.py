@@ -128,7 +128,7 @@ async def main() -> None:
     try:
         logger.info("Starting camera stream for twin %s...", twin_uuid)
         try:
-            await camera.start_streaming(camera_id=camera_id)
+            await camera.stream_video_background(camera_id=camera_id)
         except Exception:
             logger.exception(
                 "Camera stream failed with configured device '%s', trying auto-detect fallback",
@@ -149,7 +149,7 @@ async def main() -> None:
                 "Retrying camera stream using auto-detected fallback device '%s'",
                 fallback_camera_id,
             )
-            await camera.start_streaming(camera_id=fallback_camera_id)
+            await camera.stream_video_background(camera_id=fallback_camera_id)
         logger.info("Camera stream started. Waiting for shutdown signal...")
         await stop_event.wait()
     except Exception:
