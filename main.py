@@ -17,6 +17,7 @@ Camera-specific metadata params (set on the twin / asset metadata):
 """
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -99,11 +100,30 @@ async def main() -> None:
         logger.error("CYBERWAVE_TWIN_UUID environment variable is required")
         sys.exit(1)
 
-    is_depth_camera = os.getenv("CYBERWAVE_METADATA_IS_DEPTH_CAMERA", "false").lower() == "true"
+    twin_json_path = os.getenv("CYBERWAVE_TWIN_JSON_FILE")
+    twin_data: dict = {}
+    if twin_json_path:
+        try:
+            with open(twin_json_path) as f:
+                twin_data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            logger.exception("Failed to read twin JSON file at %s", twin_json_path)
+
+    asset = twin_data.get("asset") or {}
+    asset_key = asset.get("registry_id") or ""
+    if not asset_key:
+        raise ValueError("No asset.registry_id found in twin JSON")
+
+    if not twin_data.get("capabilities"):
+        raise ValueError("No capabilities found in twin JSON")
+    # it has to have at least one sensor, otherwise it's not a camera
+    if not (twin_data.get("capabilities") or {}).get("sensors"):
+        raise ValueError("No sensors found in twin JSON")
+
+    sensors = (twin_data.get("capabilities") or {}).get("sensors") or []
+    is_depth_camera = any(s.get("type") == "depth" for s in sensors)
     video_device = os.getenv("CYBERWAVE_METADATA_VIDEO_DEVICE", "0")
     camera_id = _parse_camera_id(video_device)
-
-    asset_key = "intel/realsensed455" if is_depth_camera else "cyberwave/standard-cam"
 
     logger.info(
         "Initializing camera driver for twin %s (asset=%s, device=%s)",

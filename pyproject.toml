@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cyberwave-edge-camera-driver"
-version = "0.2.5"
+version = "0.2.6"
 description = "Cyberwave Edge Camera Driver for streaming camera feeds"
 readme = "README.md"
 requires-python = ">=3.8"
