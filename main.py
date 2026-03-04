@@ -132,7 +132,7 @@ async def main() -> None:
         camera_id,
     )
 
-    client = Cyberwave(token=token, source_type="edge")
+    client = Cyberwave(api_key=token, source_type="edge")
     camera = client.twin(asset_key=asset_key, twin_id=twin_uuid)
 
     stop_event = asyncio.Event()
