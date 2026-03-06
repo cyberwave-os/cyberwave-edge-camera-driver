@@ -129,8 +129,12 @@ async def main() -> None:
     video_device = os.getenv("CYBERWAVE_METADATA_VIDEO_DEVICE", "0")
     camera_id = _parse_camera_id(video_device)
     if isinstance(camera_id, str) and camera_id.startswith("/dev/") and not os.path.exists(camera_id):
-        raise HardwareConnectionError(
-            f"Configured camera device '{camera_id}' does not exist inside the container"
+        logger.warning(
+            (
+                "Configured camera device '%s' does not exist inside the container; "
+                "will attempt auto-discovery fallback if stream start fails"
+            ),
+            camera_id,
         )
 
     logger.info(
