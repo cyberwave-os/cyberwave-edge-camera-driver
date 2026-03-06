@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import signal
-import subprocess
 import sys
 
 from cyberwave import Cyberwave
@@ -31,6 +30,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("camera-driver")
+HARDWARE_CONNECTION_EXIT_CODE = 66
+
+
+class HardwareConnectionError(RuntimeError):
+    """Raised when required camera hardware is unavailable."""
 
 
 def _list_cameras() -> tuple[list[str], list[str]]:
@@ -124,6 +128,10 @@ async def main() -> None:
     is_depth_camera = any(s.get("type") == "depth" for s in sensors)
     video_device = os.getenv("CYBERWAVE_METADATA_VIDEO_DEVICE", "0")
     camera_id = _parse_camera_id(video_device)
+    if isinstance(camera_id, str) and camera_id.startswith("/dev/") and not os.path.exists(camera_id):
+        raise HardwareConnectionError(
+            f"Configured camera device '{camera_id}' does not exist inside the container"
+        )
 
     logger.info(
         "Initializing camera driver for twin %s (asset=%s, device=%s)",
@@ -145,11 +153,13 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
+    stream_started = False
     try:
         logger.info("Starting camera stream for twin %s...", twin_uuid)
         try:
             await camera.stream_video_background(camera_id=camera_id)
-        except Exception:
+            stream_started = True
+        except Exception as stream_error:
             logger.exception(
                 "Camera stream failed with configured device '%s', trying auto-detect fallback",
                 camera_id,
@@ -157,7 +167,9 @@ async def main() -> None:
             cv2_cameras, realsense_cameras = _list_cameras()
             fallback_candidates = realsense_cameras if is_depth_camera else cv2_cameras
             if not fallback_candidates:
-                raise
+                raise HardwareConnectionError(
+                    f"No camera hardware available for configured device '{camera_id}'"
+                ) from stream_error
 
             fallback_camera_id: int | str
             if is_depth_camera:
@@ -169,17 +181,32 @@ async def main() -> None:
                 "Retrying camera stream using auto-detected fallback device '%s'",
                 fallback_camera_id,
             )
-            await camera.stream_video_background(camera_id=fallback_camera_id)
+            try:
+                await camera.stream_video_background(camera_id=fallback_camera_id)
+                stream_started = True
+            except Exception as fallback_error:
+                raise HardwareConnectionError(
+                    f"Camera hardware unavailable: could not start stream with fallback '{fallback_camera_id}'"
+                ) from fallback_error
         logger.info("Camera stream started. Waiting for shutdown signal...")
         await stop_event.wait()
-    except Exception:
-        logger.exception("Camera streaming failed")
     finally:
         logger.info("Stopping camera stream...")
-        await camera.stop_streaming()
+        if stream_started:
+            try:
+                await camera.stop_streaming()
+            except Exception:
+                logger.exception("Failed while stopping camera stream")
         client.disconnect()
         logger.info("Camera driver stopped.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except HardwareConnectionError as exc:
+        logger.error("Exiting due to camera hardware connection error: %s", exc)
+        sys.exit(HARDWARE_CONNECTION_EXIT_CODE)
+    except Exception:
+        logger.exception("Unhandled camera driver failure")
+        sys.exit(1)

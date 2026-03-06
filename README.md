@@ -55,3 +55,10 @@ Injected by `cyberwave-edge-core` at runtime:
 | `CYBERWAVE_API_KEY`          | API token                                                                                      |
 | `CYBERWAVE_TWIN_UUID`      | UUID of the camera twin to stream to                                                           |
 | `CYBERWAVE_TWIN_JSON_FILE` | Path to the twin JSON file (auto-expanded into `CYBERWAVE_METADATA_*` vars by `entrypoint.sh`) |
+
+## Failure signaling
+
+When required camera hardware is unavailable (for example, missing/disconnected USB camera), the driver exits with a non-zero code so edge-core can detect startup failures and restart loops.
+
+- Exit code `66`: hardware connection failure
+- Exit code `1`: other unhandled runtime failures
