@@ -60,5 +60,6 @@ Injected by `cyberwave-edge-core` at runtime:
 
 When required camera hardware is unavailable (for example, missing/disconnected USB camera), the driver exits with a non-zero code so edge-core can detect startup failures and restart loops.
 
+- If a configured `/dev/video*` path is missing, the driver first attempts auto-discovery fallback before exiting with a hardware error.
 - Exit code `66`: hardware connection failure
 - Exit code `1`: other unhandled runtime failures
