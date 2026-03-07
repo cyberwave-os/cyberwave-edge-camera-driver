@@ -1,6 +1,19 @@
+<p align="center">
+  <a href="https://cyberwave.com">
+    <img src="https://cyberwave.com/cyberwave-logo-black.svg" alt="Cyberwave logo" width="240" />
+  </a>
+</p>
+
 # Cyberwave Camera Driver
 
-> New to Cyberwave? [Check out the docs](https://docs.cyberwave.com)
+This module is part of **Cyberwave: Making the physical world programmable**.
+
+[![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Documentation](https://img.shields.io/badge/Documentation-docs.cyberwave.com-orange)](https://docs.cyberwave.com)
+[![Discord](https://badgen.net/badge/icon/discord?icon=discord&label&color=orange)](https://discord.gg/dfGhNrawyF)
+[![PyPI version](https://img.shields.io/pypi/v/cyberwave-edge-camera-driver.svg)](https://pypi.org/project/cyberwave-edge-camera-driver/)
+[![PyPI Python versions](https://img.shields.io/pypi/pyversions/cyberwave-edge-camera-driver.svg)](https://pypi.org/project/cyberwave-edge-camera-driver/)
+[![Docker Build](https://github.com/cyberwave-os/cyberwave-edge-camera-driver/actions/workflows/push-to-docker-hub.yml/badge.svg)](https://github.com/cyberwave-os/cyberwave-edge-camera-driver/actions/workflows/push-to-docker-hub.yml)
 
 A Cyberwave edge driver that streams a USB or depth camera feed to a digital twin.
 
@@ -63,3 +76,13 @@ When required camera hardware is unavailable (for example, missing/disconnected 
 - If a configured `/dev/video*` path is missing, the driver first attempts auto-discovery fallback before exiting with a hardware error.
 - Exit code `66`: hardware connection failure
 - Exit code `1`: other unhandled runtime failures
+
+## Contributing
+
+Contributions are welcome. Please open an issue for bugs or feature requests, and submit a pull request for improvements.
+
+## Community and Documentation
+
+- Documentation: https://docs.cyberwave.com
+- Community (Discord): https://discord.gg/dfGhNrawyF
+- Issues: https://github.com/cyberwave-os/cyberwave-edge-camera-driver/issues
