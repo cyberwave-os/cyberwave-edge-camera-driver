@@ -1,37 +1,44 @@
-FROM python:3.12-slim
-
-ARG ENABLE_REALSENSE=false
+# -----------------------------------------------------------------------------
+# Stage 1: Python + system libs for OpenCV (stable; rarely changes)
+# -----------------------------------------------------------------------------
+FROM python:3.12-slim AS base
 
 WORKDIR /app
 
-# Install system dependencies for OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy project files
+# -----------------------------------------------------------------------------
+# Stage 2: Optional RealSense — only invalidates when install_realsense_docker.sh
+# or ENABLE_REALSENSE changes, not when application *.py changes.
+# On amd64: pip wheel + libs; on arm64: builds librealsense from source.
+# -----------------------------------------------------------------------------
+FROM base AS camera-driver-base
+
+ARG ENABLE_REALSENSE=false
+
+COPY install_realsense_docker.sh .
+RUN chmod +x install_realsense_docker.sh && \
+    if [ "${ENABLE_REALSENSE}" = "true" ]; then ./install_realsense_docker.sh; \
+    else echo "Skipping RealSense (build with --build-arg ENABLE_REALSENSE=true to enable)"; fi
+
+# -----------------------------------------------------------------------------
+# Stage 3: Application — copy project last so edits to code/pyproject rebuild only here
+# -----------------------------------------------------------------------------
+FROM camera-driver-base AS runtime
+
 COPY pyproject.toml .
 COPY *.py ./
 COPY README.md .
 COPY LICENSE .
-# Install the package and its dependencies
 RUN pip install --no-cache-dir .
 
-# Optional: install RealSense support (pyrealsense2)
-# On amd64 this uses pre-built pip wheels; on arm64 it builds from source.
-COPY install_realsense_docker.sh .
-RUN if [ "${ENABLE_REALSENSE}" = "true" ]; then \
-        chmod +x install_realsense_docker.sh && ./install_realsense_docker.sh; \
-    fi
-
-# Pre-create the directory that edge-core bind-mounts with the edge config
 RUN mkdir -p /app/.cyberwave
 
-# Copy entrypoint script that loads CYBERWAVE_TWIN_JSON_FILE into env vars
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
-# Default entrypoint
 ENTRYPOINT ["./entrypoint.sh"]
