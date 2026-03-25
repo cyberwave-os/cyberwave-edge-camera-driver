@@ -126,6 +126,11 @@ async def main() -> None:
 
     sensors = (twin_data.get("capabilities") or {}).get("sensors") or []
     is_depth_camera = any(s.get("type") == "depth" for s in sensors)
+    camera_name: str | None = None
+    if sensors and isinstance(sensors[0], dict):
+        sid = sensors[0].get("id")
+        if sid is not None:
+            camera_name = str(sid)
     video_device = os.getenv("CYBERWAVE_METADATA_VIDEO_DEVICE", "0")
     camera_id = _parse_camera_id(video_device)
     if isinstance(camera_id, str) and camera_id.startswith("/dev/") and not os.path.exists(camera_id):
@@ -138,10 +143,11 @@ async def main() -> None:
         )
 
     logger.info(
-        "Initializing camera driver for twin %s (asset=%s, device=%s)",
+        "Initializing camera driver for twin %s (asset=%s, device=%s, camera_name=%s)",
         twin_uuid,
         asset_key,
         camera_id,
+        camera_name or "(from twin API default)",
     )
 
     client = Cyberwave(api_key=token, source_type="edge")
@@ -161,7 +167,9 @@ async def main() -> None:
     try:
         logger.info("Starting camera stream for twin %s...", twin_uuid)
         try:
-            await camera.stream_video_background(camera_id=camera_id)
+            await camera.stream_video_background(
+                camera_id=camera_id, camera_name=camera_name, fps=30
+            )
             stream_started = True
         except Exception as stream_error:
             logger.exception(
@@ -186,7 +194,9 @@ async def main() -> None:
                 fallback_camera_id,
             )
             try:
-                await camera.stream_video_background(camera_id=fallback_camera_id)
+                await camera.stream_video_background(
+                    camera_id=fallback_camera_id, camera_name=camera_name, fps=30
+                )
                 stream_started = True
             except Exception as fallback_error:
                 raise HardwareConnectionError(
