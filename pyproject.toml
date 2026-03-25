@@ -30,7 +30,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "cyberwave[camera]>=0.3.44",
+    "cyberwave[camera]>=0.3.45",
     "python-dotenv>=1.0.0",
 ]
 
