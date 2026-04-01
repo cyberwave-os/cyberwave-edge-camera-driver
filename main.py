@@ -240,19 +240,24 @@ async def main() -> None:
     frame_slot: _FrameSlot | None = None
     stop_publisher = threading.Event()
     publisher_thread: threading.Thread | None = None
+    publish_zenoh = False
 
-    from cyberwave.data.config import BackendConfig, is_zenoh_publish_enabled
+    if os.getenv("CYBERWAVE_DATA_BACKEND"):
+        try:
+            from cyberwave.data.config import BackendConfig, is_zenoh_publish_enabled
 
-    backend_cfg = BackendConfig()
-    publish_zenoh = is_zenoh_publish_enabled(backend_cfg) and bool(
-        os.getenv("CYBERWAVE_DATA_BACKEND")
-    )
-    logger.info(
-        "Driver publish config: mode=%s | Zenoh=%s | backend=%s",
-        backend_cfg.publish_mode,
-        "active" if publish_zenoh else "disabled",
-        backend_cfg.backend if publish_zenoh else "n/a",
-    )
+            backend_cfg = BackendConfig()
+            publish_zenoh = is_zenoh_publish_enabled(backend_cfg)
+            logger.info(
+                "Driver publish config: mode=%s | Zenoh=%s | backend=%s",
+                backend_cfg.publish_mode,
+                "active" if publish_zenoh else "disabled",
+                backend_cfg.backend if publish_zenoh else "n/a",
+            )
+        except ImportError:
+            logger.info(
+                "cyberwave.data module not available; Zenoh publishing disabled"
+            )
 
     if publish_zenoh:
         try:
