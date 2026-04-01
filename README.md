@@ -69,6 +69,18 @@ Injected by `cyberwave-edge-core` at runtime:
 | `CYBERWAVE_TWIN_UUID`      | UUID of the camera twin to stream to                                                           |
 | `CYBERWAVE_TWIN_JSON_FILE` | Path to the twin JSON file (auto-expanded into `CYBERWAVE_METADATA_*` vars by `entrypoint.sh`) |
 
+## Zenoh data bus
+
+When `CYBERWAVE_DATA_BACKEND=zenoh` (or `filesystem`) is set, this driver publishes sensor data to the local Zenoh data bus in addition to the WebRTC cloud path:
+
+| Channel          | Payload                                    |
+| ---------------- | ------------------------------------------ |
+| `frames/default` | Raw BGR uint8 frames via SDK binary header |
+
+Worker containers can subscribe with `cw.data.subscribe("frames/default", callback)` — no adapter code required.
+
+Set `CYBERWAVE_PUBLISH_MODE` to control which paths are active (`dual`, `zenoh_only`, `mqtt_only`). Default is `dual`.
+
 ## Failure signaling
 
 When required camera hardware is unavailable (for example, missing/disconnected USB camera), the driver exits with a non-zero code so edge-core can detect startup failures and restart loops.
