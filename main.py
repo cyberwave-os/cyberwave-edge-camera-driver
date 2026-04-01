@@ -22,7 +22,10 @@ import logging
 import os
 import signal
 import sys
+import threading
+import time
 
+import numpy as np
 from cyberwave import Cyberwave
 
 logging.basicConfig(
@@ -93,6 +96,85 @@ def _parse_camera_id(video_device: str) -> int | str:
         return video_device
 
 
+class _FrameSlot:
+    """Single-slot thread-safe frame buffer.
+
+    Producer (capture thread) calls put(); consumer (publisher thread)
+    calls take().  When the producer is faster than the consumer, the
+    older frame is silently replaced -- matching the ``latest`` Zenoh
+    subscriber policy and keeping memory constant.
+    """
+
+    def __init__(self) -> None:
+        self._frame: np.ndarray | None = None
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+
+    def put(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._frame = frame
+        self._event.set()
+
+    def take(self, timeout: float = 1.0) -> np.ndarray | None:
+        self._event.wait(timeout)
+        self._event.clear()
+        with self._lock:
+            frame = self._frame
+            self._frame = None
+        return frame
+
+
+def _zenoh_publisher_thread(
+    data_bus: object,
+    slot: _FrameSlot,
+    stop: threading.Event,
+    channel: str,
+    fps: int,
+) -> None:
+    """Read frames from *slot* and publish to the data bus.
+
+    Runs on a dedicated daemon thread.  Drops frames when the publisher
+    is slower than the capture loop (single-slot semantics).
+    """
+    if data_bus is None:
+        return
+
+    try:
+        backend_name = type(data_bus._backend).__name__  # type: ignore[attr-defined]  # noqa: SLF001
+        logger.info(
+            "Zenoh frame publisher active (backend=%s, channel=%s)",
+            backend_name,
+            channel,
+        )
+    except Exception:
+        pass
+
+    budget_s = 1.0 / fps * 2
+    _first = True
+
+    while not stop.is_set():
+        frame = slot.take(timeout=1.0)
+        if frame is None:
+            continue
+        t0 = time.monotonic()
+        try:
+            if _first:
+                data_bus.publish(channel, frame, metadata={"fps": fps})  # type: ignore[attr-defined]
+                _first = False
+            else:
+                data_bus.publish(channel, frame)  # type: ignore[attr-defined]
+        except Exception:
+            logger.warning("Zenoh frame publish failed", exc_info=True)
+        elapsed = time.monotonic() - t0
+        if elapsed > budget_s:
+            logger.warning(
+                "Zenoh publish for %s took %.1f ms (budget %.1f ms)",
+                channel,
+                elapsed * 1000,
+                budget_s * 1000,
+            )
+
+
 async def main() -> None:
     token = os.getenv("CYBERWAVE_API_KEY")
     twin_uuid = os.getenv("CYBERWAVE_TWIN_UUID")
@@ -153,6 +235,53 @@ async def main() -> None:
     client = Cyberwave(api_key=token, source_type="edge")
     camera = client.twin(asset_key=asset_key, twin_id=twin_uuid)
 
+    # ── Zenoh data bus initialization ──
+    data_bus = None
+    frame_slot: _FrameSlot | None = None
+    stop_publisher = threading.Event()
+    publisher_thread: threading.Thread | None = None
+
+    from cyberwave.data.config import BackendConfig, is_zenoh_publish_enabled
+
+    backend_cfg = BackendConfig()
+    publish_zenoh = is_zenoh_publish_enabled(backend_cfg) and bool(
+        os.getenv("CYBERWAVE_DATA_BACKEND")
+    )
+    logger.info(
+        "Driver publish config: mode=%s | Zenoh=%s | backend=%s",
+        backend_cfg.publish_mode,
+        "active" if publish_zenoh else "disabled",
+        backend_cfg.backend if publish_zenoh else "n/a",
+    )
+
+    if publish_zenoh:
+        try:
+            data_bus = client.data
+            camera_channel = f"frames/{camera_name}" if camera_name else "frames/default"
+            frame_slot = _FrameSlot()
+            publisher_thread = threading.Thread(
+                target=_zenoh_publisher_thread,
+                args=(data_bus, frame_slot, stop_publisher, camera_channel, 30),
+                daemon=True,
+                name="zenoh-frame-publisher",
+            )
+            publisher_thread.start()
+            logger.info("Zenoh frame publishing enabled on channel '%s'", camera_channel)
+        except Exception:
+            logger.warning(
+                "Failed to initialize data bus for Zenoh publishing; "
+                "falling back to WebRTC-only mode",
+                exc_info=True,
+            )
+            data_bus = None
+            frame_slot = None
+
+    def _on_frame(frame: np.ndarray, _frame_count: int) -> None:
+        if frame_slot is not None:
+            frame_slot.put(frame)
+
+    frame_callback = _on_frame if data_bus is not None else None
+
     stop_event = asyncio.Event()
 
     def _handle_signal() -> None:
@@ -168,7 +297,10 @@ async def main() -> None:
         logger.info("Starting camera stream for twin %s...", twin_uuid)
         try:
             await camera.stream_video_background(
-                camera_id=camera_id, camera_name=camera_name, fps=30
+                camera_id=camera_id,
+                camera_name=camera_name,
+                fps=30,
+                frame_callback=frame_callback,
             )
             stream_started = True
         except Exception as stream_error:
@@ -195,7 +327,10 @@ async def main() -> None:
             )
             try:
                 await camera.stream_video_background(
-                    camera_id=fallback_camera_id, camera_name=camera_name, fps=30
+                    camera_id=fallback_camera_id,
+                    camera_name=camera_name,
+                    fps=30,
+                    frame_callback=frame_callback,
                 )
                 stream_started = True
             except Exception as fallback_error:
@@ -206,6 +341,9 @@ async def main() -> None:
         await stop_event.wait()
     finally:
         logger.info("Stopping camera stream...")
+        stop_publisher.set()
+        if publisher_thread is not None:
+            publisher_thread.join(timeout=5.0)
         if stream_started:
             try:
                 await camera.stop_streaming()
