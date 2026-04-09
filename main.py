@@ -40,6 +40,11 @@ class HardwareConnectionError(RuntimeError):
     """Raised when required camera hardware is unavailable."""
 
 
+def should_retry_camera_start(stop_event: asyncio.Event) -> bool:
+    """Only retry startup when no shutdown has been requested."""
+    return not stop_event.is_set()
+
+
 def _list_cameras() -> tuple[list[str], list[str]]:
     """List all available RealSense cameras, like the following:
     ```bash
@@ -309,6 +314,11 @@ async def main() -> None:
             )
             stream_started = True
         except Exception as stream_error:
+            if not should_retry_camera_start(stop_event):
+                logger.info(
+                    "Shutdown requested during stream startup; skipping fallback retry"
+                )
+                return
             logger.exception(
                 "Camera stream failed with configured device '%s', trying auto-detect fallback",
                 camera_id,
