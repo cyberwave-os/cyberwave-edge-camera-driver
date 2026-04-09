@@ -40,9 +40,9 @@ class HardwareConnectionError(RuntimeError):
     """Raised when required camera hardware is unavailable."""
 
 
-def should_retry_camera_start(stop_event: asyncio.Event) -> bool:
+def should_retry_camera_start(shutdown_requested: bool) -> bool:
     """Only retry startup when no shutdown has been requested."""
-    return not stop_event.is_set()
+    return not shutdown_requested
 
 
 def _list_cameras() -> tuple[list[str], list[str]]:
@@ -293,9 +293,12 @@ async def main() -> None:
     frame_callback = _on_frame if data_bus is not None else None
 
     stop_event = asyncio.Event()
+    shutdown_requested = False
 
     def _handle_signal() -> None:
+        nonlocal shutdown_requested
         logger.info("Shutdown signal received, stopping...")
+        shutdown_requested = True
         stop_event.set()
 
     loop = asyncio.get_running_loop()
@@ -314,7 +317,7 @@ async def main() -> None:
             )
             stream_started = True
         except Exception as stream_error:
-            if not should_retry_camera_start(stop_event):
+            if not should_retry_camera_start(shutdown_requested):
                 logger.info(
                     "Shutdown requested during stream startup; skipping fallback retry"
                 )
