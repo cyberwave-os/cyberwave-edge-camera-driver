@@ -63,11 +63,13 @@ Then reference the RealSense image in your asset metadata:
 
 Injected by `cyberwave-edge-core` at runtime:
 
-| Variable                   | Description                                                                                    |
-| -------------------------- | ---------------------------------------------------------------------------------------------- |
-| `CYBERWAVE_API_KEY`          | API token                                                                                      |
-| `CYBERWAVE_TWIN_UUID`      | UUID of the camera twin to stream to                                                           |
-| `CYBERWAVE_TWIN_JSON_FILE` | Path to the twin JSON file (auto-expanded into `CYBERWAVE_METADATA_*` vars by `entrypoint.sh`) |
+| Variable                          | Description                                                                                    |
+| --------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `CYBERWAVE_API_KEY`               | API token                                                                                      |
+| `CYBERWAVE_TWIN_UUID`             | UUID of the camera twin to stream to                                                           |
+| `CYBERWAVE_TWIN_JSON_FILE`        | Path to the twin JSON file (auto-expanded into `CYBERWAVE_METADATA_*` vars by `entrypoint.sh`) |
+| `CYBERWAVE_FRAME_ENCODING`        | `raw` (default) for numpy arrays via SHM, or `jpeg` for JPEG-encoded frames (lower bandwidth)  |
+| `CYBERWAVE_FRAME_JPEG_QUALITY`    | JPEG quality 1-100 when encoding is `jpeg` (default: `90`)                                     |
 
 ## Zenoh data bus
 

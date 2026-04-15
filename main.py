@@ -129,17 +129,36 @@ class _FrameSlot:
         return frame
 
 
+def _encode_jpeg(frame: np.ndarray, quality: int = 90) -> bytes:
+    """JPEG-encode a BGR numpy frame, returning raw JPEG bytes."""
+    import cv2
+
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise RuntimeError("cv2.imencode failed")
+    return buf.tobytes()
+
+
 def _zenoh_publisher_thread(
     data_bus: object,
     slot: _FrameSlot,
     stop: threading.Event,
     channel: str,
     fps: int,
+    *,
+    encoding: str = "raw",
+    jpeg_quality: int = 90,
 ) -> None:
     """Read frames from *slot* and publish to the data bus.
 
     Runs on a dedicated daemon thread.  Drops frames when the publisher
     is slower than the capture loop (single-slot semantics).
+
+    Args:
+        encoding: ``"raw"`` publishes numpy arrays through the SDK wire
+            format (zero-copy capable via SHM on same-host).  ``"jpeg"``
+            JPEG-encodes frames before publishing — useful for remote or
+            bridged subscribers that need lower bandwidth.
     """
     if data_bus is None:
         return
@@ -147,13 +166,15 @@ def _zenoh_publisher_thread(
     try:
         backend_name = type(data_bus._backend).__name__  # type: ignore[attr-defined]  # noqa: SLF001
         logger.info(
-            "Zenoh frame publisher active (backend=%s, channel=%s)",
+            "Zenoh frame publisher active (backend=%s, channel=%s, encoding=%s)",
             backend_name,
             channel,
+            encoding,
         )
     except Exception:
         pass
 
+    use_jpeg = encoding == "jpeg"
     budget_s = 1.0 / fps * 2
     _first = True
 
@@ -163,7 +184,11 @@ def _zenoh_publisher_thread(
             continue
         t0 = time.monotonic()
         try:
-            if _first:
+            if use_jpeg:
+                # Publish raw JPEG bytes without SDK wire-format header so
+                # subscribers detect the JPEG SOI marker and decode to numpy.
+                data_bus.publish_raw(channel, _encode_jpeg(frame, jpeg_quality))  # type: ignore[attr-defined]
+            elif _first:
                 data_bus.publish(channel, frame, metadata={"fps": fps})  # type: ignore[attr-defined]
                 _first = False
             else:
@@ -264,6 +289,15 @@ async def main() -> None:
                 "cyberwave.data module not available; Zenoh publishing disabled"
             )
 
+    frame_encoding = os.getenv("CYBERWAVE_FRAME_ENCODING", "raw").lower()
+    if frame_encoding not in ("raw", "jpeg"):
+        logger.warning(
+            "Unknown CYBERWAVE_FRAME_ENCODING '%s'; defaulting to 'raw'",
+            frame_encoding,
+        )
+        frame_encoding = "raw"
+    jpeg_quality = int(os.getenv("CYBERWAVE_FRAME_JPEG_QUALITY", "90"))
+
     if publish_zenoh:
         try:
             data_bus = client.data
@@ -272,11 +306,16 @@ async def main() -> None:
             publisher_thread = threading.Thread(
                 target=_zenoh_publisher_thread,
                 args=(data_bus, frame_slot, stop_publisher, camera_channel, 30),
+                kwargs={"encoding": frame_encoding, "jpeg_quality": jpeg_quality},
                 daemon=True,
                 name="zenoh-frame-publisher",
             )
             publisher_thread.start()
-            logger.info("Zenoh frame publishing enabled on channel '%s'", camera_channel)
+            logger.info(
+                "Zenoh frame publishing enabled on channel '%s' (encoding=%s)",
+                camera_channel,
+                frame_encoding,
+            )
         except Exception:
             logger.warning(
                 "Failed to initialize data bus for Zenoh publishing; "
