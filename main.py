@@ -340,7 +340,26 @@ async def main() -> None:
             data_bus = None
             frame_slot = None
         else:
-            camera_channel = f"frames/{camera_name}" if camera_name else "frames/default"
+            if camera_name:
+                camera_channel = f"frames/{camera_name}"
+            else:
+                # The twin's asset didn't declare a camera sensor name.  We
+                # still publish (under the legacy ``frames/default`` key) so
+                # workers subscribing with the SDK's wildcard default keep
+                # receiving frames, but loudly flag the drift — every real
+                # twin should declare a sensor in its asset schema so the
+                # driver, worker, and doctor probe all agree on one name.
+                camera_channel = "frames/default"
+                logger.warning(
+                    "Twin %s did not expose a camera sensor name via "
+                    "`asset_key=%s`; falling back to the legacy "
+                    "'frames/default' key. Declare a sensor (e.g. "
+                    "'color_camera') in the twin's asset schema so "
+                    "@cw.on_frame hooks can pin to a specific sensor and "
+                    "`cyberwave worker doctor` can validate the binding.",
+                    twin_uuid,
+                    asset_key,
+                )
             frame_slot = _FrameSlot()
             publisher_thread = threading.Thread(
                 target=_zenoh_publisher_thread,

@@ -73,13 +73,14 @@ Injected by `cyberwave-edge-core` at runtime:
 
 ## Zenoh data bus
 
-When `CYBERWAVE_DATA_BACKEND=zenoh` (or `filesystem`) is set, this driver publishes sensor data to the local Zenoh data bus in addition to the WebRTC cloud path:
+When `CYBERWAVE_DATA_BACKEND=zenoh` (or `filesystem`) is set, this driver publishes sensor data to the local Zenoh data bus in addition to the WebRTC cloud path. The channel name is taken from the twin's asset schema so the sensor segment is meaningful (e.g. `color_camera`, `depth_camera`):
 
-| Channel          | Payload                                    |
-| ---------------- | ------------------------------------------ |
-| `frames/default` | Raw BGR uint8 frames via SDK binary header |
+| Channel                       | Payload                                    |
+| ----------------------------- | ------------------------------------------ |
+| `frames/<sensor>` (from asset) | Raw BGR uint8 frames via SDK binary header |
+| `frames/default` (legacy)     | Only when the twin's asset declares no camera sensor — the driver logs a warning pointing at the drift |
 
-Worker containers can subscribe with `cw.data.subscribe("frames/default", callback)` — no adapter code required.
+Worker containers can subscribe with `@cw.on_frame(twin_uuid)` (wildcard — matches any camera on the twin) or pin to a specific sensor via `@cw.on_frame(twin_uuid, sensor="color_camera")`. Use `cyberwave worker doctor` to verify that the expected subscription keys match what the driver actually publishes.
 
 Set `CYBERWAVE_PUBLISH_MODE` to control which paths are active (`dual`, `zenoh_only`, `mqtt_only`). Default is `dual`.
 
