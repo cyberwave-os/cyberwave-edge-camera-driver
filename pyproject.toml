@@ -30,7 +30,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "cyberwave[camera]>=0.4.0",
+    # [zenoh] is required for the same-host frame bus; publishing silently
+    # degraded to WebRTC-only before 0.4.3 when eclipse-zenoh was missing.
+    "cyberwave[camera,zenoh]>=0.4.2",
     "python-dotenv>=1.0.0",
 ]
 

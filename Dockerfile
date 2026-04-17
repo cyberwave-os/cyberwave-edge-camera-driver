@@ -38,7 +38,7 @@ COPY LICENSE .
 # An empty sdk-local/ directory is used in production builds so this step is a no-op.
 COPY sdk-local /tmp/sdk-local
 RUN if [ -f "/tmp/sdk-local/pyproject.toml" ]; then \
-      pip install --no-cache-dir "/tmp/sdk-local[camera]"; \
+      pip install --no-cache-dir "/tmp/sdk-local[camera,zenoh]"; \
     fi
 RUN pip install --no-cache-dir .
 

@@ -272,12 +272,18 @@ async def main() -> None:
     publisher_thread: threading.Thread | None = None
     publish_zenoh = False
 
+    # ``zenoh_only`` decides whether we crash on init failure or degrade.
+    # Captured here so the exception handler below doesn't have to reach
+    # back into ``backend_cfg`` (which only exists when the import worked).
+    zenoh_only = False
+
     if os.getenv("CYBERWAVE_DATA_BACKEND"):
         try:
             from cyberwave.data.config import BackendConfig, is_zenoh_publish_enabled
 
             backend_cfg = BackendConfig()
             publish_zenoh = is_zenoh_publish_enabled(backend_cfg)
+            zenoh_only = backend_cfg.publish_mode == "zenoh_only"
             logger.info(
                 "Driver publish config: mode=%s | Zenoh=%s | backend=%s",
                 backend_cfg.publish_mode,
@@ -301,6 +307,39 @@ async def main() -> None:
     if publish_zenoh:
         try:
             data_bus = client.data
+        except Exception as exc:
+            # Give a targeted hint when eclipse-zenoh is missing — this was the
+            # silent failure mode that masqueraded as WebRTC-only streaming.
+            hint = ""
+            try:
+                from cyberwave.data.exceptions import BackendUnavailableError
+
+                if isinstance(exc, BackendUnavailableError):
+                    hint = (
+                        "  Install eclipse-zenoh in the driver image, e.g. "
+                        "`pip install 'cyberwave[camera,zenoh]'`."
+                    )
+            except ImportError:
+                pass
+            if zenoh_only:
+                logger.error(
+                    "Failed to initialize Zenoh data bus and publish_mode=zenoh_only; "
+                    "aborting driver startup.%s",
+                    hint,
+                    exc_info=True,
+                )
+                raise
+            logger.error(
+                "Failed to initialize Zenoh data bus; on-edge workers will not "
+                "receive frames from this driver. Cloud-side WebRTC streaming "
+                "continues, but any @cw.on_frame hook on this twin will stay "
+                "idle.%s",
+                hint,
+                exc_info=True,
+            )
+            data_bus = None
+            frame_slot = None
+        else:
             camera_channel = f"frames/{camera_name}" if camera_name else "frames/default"
             frame_slot = _FrameSlot()
             publisher_thread = threading.Thread(
@@ -316,14 +355,6 @@ async def main() -> None:
                 camera_channel,
                 frame_encoding,
             )
-        except Exception:
-            logger.warning(
-                "Failed to initialize data bus for Zenoh publishing; "
-                "falling back to WebRTC-only mode",
-                exc_info=True,
-            )
-            data_bus = None
-            frame_slot = None
 
     def _on_frame(frame: np.ndarray, _frame_count: int) -> None:
         if frame_slot is not None:

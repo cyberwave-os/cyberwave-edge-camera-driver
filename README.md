@@ -83,13 +83,15 @@ Worker containers can subscribe with `cw.data.subscribe("frames/default", callba
 
 Set `CYBERWAVE_PUBLISH_MODE` to control which paths are active (`dual`, `zenoh_only`, `mqtt_only`). Default is `dual`.
 
+The driver depends on `cyberwave[camera,zenoh]`, which pulls in `eclipse-zenoh`. If the data bus cannot be opened at startup (for example, the router is unreachable) the driver logs an error pointing at the missing dependency and — when `CYBERWAVE_PUBLISH_MODE=zenoh_only` — exits rather than silently falling back to WebRTC-only.
+
 ## Failure signaling
 
 When required camera hardware is unavailable (for example, missing/disconnected USB camera), the driver exits with a non-zero code so edge-core can detect startup failures and restart loops.
 
 - If a configured `/dev/video*` path is missing, the driver first attempts auto-discovery fallback before exiting with a hardware error.
 - Exit code `66`: hardware connection failure
-- Exit code `1`: other unhandled runtime failures
+- Exit code `1`: other unhandled runtime failures (including Zenoh init failure when `CYBERWAVE_PUBLISH_MODE=zenoh_only`)
 
 ## Contributing
 
