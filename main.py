@@ -4,9 +4,18 @@ Streams a camera feed to a Cyberwave digital twin. Launched by cyberwave-edge-co
 with the following environment variables set:
 
   CYBERWAVE_API_KEY          – API token
-  CYBERWAVE_TWIN_UUID      – UUID of the camera twin to stream to
-  CYBERWAVE_TWIN_JSON_FILE – Path to the JSON file describing the twin (expanded
-                             into CYBERWAVE_METADATA_* vars by entrypoint.sh)
+  CYBERWAVE_TWIN_UUID        – UUID of the camera twin to stream to
+  CYBERWAVE_TWIN_JSON_FILE   – Path to the JSON file describing the twin (expanded
+                               into CYBERWAVE_METADATA_* vars by entrypoint.sh)
+
+Optional env vars:
+
+  CYBERWAVE_DETECTION_OVERLAYS    – "true" (default) to subscribe to
+                                    ``cw/<twin_uuid>/data/detections/**`` and
+                                    draw YOLO-style bounding boxes on the
+                                    WebRTC stream. "false" disables overlays.
+                                    Automatically disabled for twins that
+                                    declare a depth sensor.
 
 Camera-specific metadata params (set on the twin / asset metadata):
 
@@ -24,6 +33,7 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass
 
 import numpy as np
 from cyberwave import Cyberwave
@@ -139,6 +149,154 @@ def _encode_jpeg(frame: np.ndarray, quality: int = 90) -> bytes:
     return buf.tobytes()
 
 
+# ── Detection overlay ──────────────────────────────────────────────
+#
+# Mirrors the C++ OBSBOT driver: an ML worker publishes JSON detection
+# payloads on ``cw/<twin_uuid>/data/detections/<runtime>``; the driver caches
+# the latest batch and draws bounding boxes on frames before WebRTC encoding.
+# The capture thread copies the frame before drawing, so Zenoh subscribers on
+# ``frames/*`` (including the ML worker itself) only ever see clean pixels.
+#
+# Overlays are RGB-only — depth cameras (RealSense) skip this path.
+
+_DETECTIONS_STALE_MS = 1000  # matches the OBSBOT C++ driver's `> 1000` check
+
+
+@dataclass(slots=True, frozen=True)
+class DetectionBox:
+    """A single bounding box emitted by an ML worker."""
+
+    label: str
+    confidence: float
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+
+
+class _DetectionCache:
+    """Thread-safe holder for the most recent detection batch.
+
+    Updated by the Zenoh subscriber thread, read by the capture thread.
+    Returns ``None`` from :meth:`snapshot` when the cache is empty or the
+    batch is older than :data:`_DETECTIONS_STALE_MS`.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._boxes: list[DetectionBox] = []
+        self._frame_w = 0
+        self._frame_h = 0
+        self._updated_at = 0.0
+
+    def update(self, boxes: list[DetectionBox], frame_w: int, frame_h: int) -> None:
+        with self._lock:
+            self._boxes = boxes
+            self._frame_w = frame_w
+            self._frame_h = frame_h
+            self._updated_at = time.monotonic()
+
+    def snapshot(self) -> tuple[list[DetectionBox], int, int] | None:
+        with self._lock:
+            if not self._boxes:
+                return None
+            if (time.monotonic() - self._updated_at) * 1000.0 > _DETECTIONS_STALE_MS:
+                return None
+            # Return a shallow copy so callers can't mutate the cache's list
+            # out from under the subscriber thread.  ``DetectionBox`` is frozen,
+            # so the shallow copy is sufficient.
+            return list(self._boxes), self._frame_w, self._frame_h
+
+
+def _parse_detections_payload(payload: bytes) -> tuple[list[DetectionBox], int, int] | None:
+    """Decode a JSON detection payload. Returns ``None`` on parse error."""
+    try:
+        data = json.loads(payload)
+        dets_raw = data.get("detections") or []
+        frame_w = int(data.get("frame_width", 0) or 0)
+        frame_h = int(data.get("frame_height", 0) or 0)
+        boxes: list[DetectionBox] = []
+        for det in dets_raw:
+            if not isinstance(det, dict):
+                continue
+            boxes.append(
+                DetectionBox(
+                    label=str(det.get("label", "?")),
+                    confidence=float(det.get("confidence", 0.0) or 0.0),
+                    x1=int(det.get("x1", 0) or 0),
+                    y1=int(det.get("y1", 0) or 0),
+                    x2=int(det.get("x2", 0) or 0),
+                    y2=int(det.get("y2", 0) or 0),
+                )
+            )
+    except (ValueError, TypeError, AttributeError):
+        logger.debug("Failed to parse detection payload", exc_info=True)
+        return None
+    return boxes, frame_w, frame_h
+
+
+def _draw_detections(
+    frame: np.ndarray,
+    boxes: list[DetectionBox],
+    det_w: int,
+    det_h: int,
+) -> None:
+    """Draw ``boxes`` in-place on ``frame``.
+
+    Matches the OBSBOT C++ draw routine (same colors, font, and label
+    background style) so the frontend renders both driver families
+    identically.
+    """
+    import cv2
+
+    h, w = frame.shape[:2]
+    sx = (w / det_w) if det_w > 0 else 1.0
+    sy = (h / det_h) if det_h > 0 else 1.0
+
+    for box in boxes:
+        x1 = int(box.x1 * sx)
+        y1 = int(box.y1 * sy)
+        x2 = int(box.x2 * sx)
+        y2 = int(box.y2 * sy)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        label = f"{box.label} {box.confidence * 100.0:.0f}%"
+        (text_w, text_h), _baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+        # Place the label above the bbox when there's room, otherwise drop it
+        # inside the top of the bbox so near-edge detections don't render with
+        # the label clipped off the frame.
+        if y1 - text_h - 6 >= 0:
+            bg_top, bg_bottom, text_y = y1 - text_h - 6, y1, y1 - 4
+        else:
+            bg_top, bg_bottom, text_y = y1, y1 + text_h + 6, y1 + text_h + 2
+        cv2.rectangle(
+            frame,
+            (x1, bg_top),
+            (x1 + text_w + 4, bg_bottom),
+            (0, 255, 0),
+            cv2.FILLED,
+        )
+        cv2.putText(
+            frame,
+            label,
+            (x1 + 2, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _detection_overlays_enabled_env() -> bool:
+    """Resolve ``CYBERWAVE_DETECTION_OVERLAYS`` (defaults to enabled)."""
+    raw = os.getenv("CYBERWAVE_DETECTION_OVERLAYS")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def _zenoh_publisher_thread(
     data_bus: object,
     slot: _FrameSlot,
@@ -185,8 +343,6 @@ def _zenoh_publisher_thread(
         t0 = time.monotonic()
         try:
             if use_jpeg:
-                # Publish raw JPEG bytes without SDK wire-format header so
-                # subscribers detect the JPEG SOI marker and decode to numpy.
                 data_bus.publish_raw(channel, _encode_jpeg(frame, jpeg_quality))  # type: ignore[attr-defined]
             elif _first:
                 data_bus.publish(channel, frame, metadata={"fps": fps})  # type: ignore[attr-defined]
@@ -375,9 +531,64 @@ async def main() -> None:
                 frame_encoding,
             )
 
+    # ── Detection overlay subscription ──
+    # Subscribe to ``cw/<twin_uuid>/data/detections/**`` so ML workers
+    # (ultralytics, onnxruntime, ...) can push YOLO-style results that the
+    # driver draws on the WebRTC stream.  Same payload schema as the C++
+    # OBSBOT driver.
+    detection_cache: _DetectionCache | None = None
+    detection_subscription = None
+    if data_bus is not None and not is_depth_camera and _detection_overlays_enabled_env():
+        try:
+            from cyberwave.data.backend import Sample
+            from cyberwave.data.keys import build_wildcard
+
+            local_cache = _DetectionCache()
+            detections_key = build_wildcard(
+                twin_uuid=twin_uuid,
+                channel="detections",
+                prefix=data_bus.key_prefix,
+            )
+
+            def _on_detection_sample(sample: Sample) -> None:
+                parsed = _parse_detections_payload(sample.payload)
+                if parsed is None:
+                    return
+                boxes, frame_w, frame_h = parsed
+                local_cache.update(boxes, frame_w, frame_h)
+
+            detection_subscription = data_bus.backend.subscribe(
+                detections_key,
+                _on_detection_sample,
+                policy="latest",
+            )
+            detection_cache = local_cache
+            logger.info("Detection overlay subscriber active on key '%s'", detections_key)
+        except Exception as exc:
+            logger.warning(
+                "Detection overlay subscription failed (%s: %s); bounding boxes disabled",
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            detection_cache = None
+            detection_subscription = None
+    elif data_bus is not None and is_depth_camera:
+        logger.info("Detection overlays disabled: depth cameras are not supported")
+
     def _on_frame(frame: np.ndarray, _frame_count: int) -> None:
-        if frame_slot is not None:
+        # Zero-copy fast path when no fresh detections are cached.  Otherwise
+        # copy the frame before drawing so Zenoh subscribers (and ML workers)
+        # only see clean pixels, and mutate the original in place for WebRTC.
+        if frame_slot is None:
+            return
+        snap = detection_cache.snapshot() if detection_cache is not None else None
+        if snap is None:
             frame_slot.put(frame)
+            return
+        frame_slot.put(frame.copy())
+        boxes, det_w, det_h = snap
+        _draw_detections(frame, boxes, det_w, det_h)
 
     frame_callback = _on_frame if data_bus is not None else None
 
@@ -448,6 +659,11 @@ async def main() -> None:
         await stop_event.wait()
     finally:
         logger.info("Stopping camera stream...")
+        if detection_subscription is not None:
+            try:
+                detection_subscription.close()
+            except Exception:
+                logger.debug("Detection subscription close failed", exc_info=True)
         stop_publisher.set()
         if publisher_thread is not None:
             publisher_thread.join(timeout=5.0)

@@ -70,6 +70,7 @@ Injected by `cyberwave-edge-core` at runtime:
 | `CYBERWAVE_TWIN_JSON_FILE`        | Path to the twin JSON file (auto-expanded into `CYBERWAVE_METADATA_*` vars by `entrypoint.sh`) |
 | `CYBERWAVE_FRAME_ENCODING`        | `raw` (default) for numpy arrays via SHM, or `jpeg` for JPEG-encoded frames (lower bandwidth)  |
 | `CYBERWAVE_FRAME_JPEG_QUALITY`    | JPEG quality 1-100 when encoding is `jpeg` (default: `90`)                                     |
+| `CYBERWAVE_DETECTION_OVERLAYS`    | `true` (default) to draw YOLO bounding boxes from the `detections/*` Zenoh channel on the WebRTC stream. Set to `false` to disable. Ignored on depth cameras. |
 
 ## Zenoh data bus
 
@@ -83,6 +84,28 @@ When `CYBERWAVE_DATA_BACKEND=zenoh` (or `filesystem`) is set, this driver publis
 Worker containers can subscribe with `@cw.on_frame(twin_uuid)` (wildcard — matches any camera on the twin) or pin to a specific sensor via `@cw.on_frame(twin_uuid, sensor="color_camera")`. Use `cyberwave worker doctor` to verify that the expected subscription keys match what the driver actually publishes.
 
 Set `CYBERWAVE_PUBLISH_MODE` to control which paths are active (`dual`, `zenoh_only`, `mqtt_only`). Default is `dual`.
+
+## Detection overlays
+
+When an ML worker publishes YOLO-style detection results on `cw/<twin_uuid>/data/detections/<runtime>` (for example `detections/ultralytics` or `detections/onnxruntime`), the driver draws bounding boxes and labels on the video stream before WebRTC encoding. The overlays appear in the frontend without any client-side changes.
+
+Frames published upstream on `frames/<sensor>` are always **clean** — the driver copies the capture buffer before drawing, so the ML worker never sees annotated images.
+
+Detection messages are expected as raw JSON:
+
+```json
+{
+  "detections": [
+    {"label": "person", "confidence": 0.92, "x1": 120, "y1": 80, "x2": 340, "y2": 620}
+  ],
+  "frame_width": 1920,
+  "frame_height": 1080
+}
+```
+
+Coordinates are in pixel space of the detection frame; the driver scales them to the capture resolution and drops detections older than one second (matching the OBSBOT C++ driver) so the zero-copy fast path resumes as soon as the ML worker stops publishing.
+
+Overlays are enabled by default on RGB cameras. Set `CYBERWAVE_DETECTION_OVERLAYS=false` to disable. Twins that declare a depth sensor in their capabilities skip this path automatically.
 
 The driver depends on `cyberwave[camera,zenoh]`, which pulls in `eclipse-zenoh`. If the data bus cannot be opened at startup (for example, the router is unreachable) the driver logs an error pointing at the missing dependency and — when `CYBERWAVE_PUBLISH_MODE=zenoh_only` — exits rather than silently falling back to WebRTC-only.
 
