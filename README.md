@@ -103,7 +103,7 @@ Detection messages are expected as raw JSON:
 }
 ```
 
-Coordinates are in pixel space of the detection frame; the driver scales them to the capture resolution and drops detections older than one second (matching the OBSBOT C++ driver) so the zero-copy fast path resumes as soon as the ML worker stops publishing.
+Coordinates are in pixel space of the detection frame; the driver scales them to the capture resolution and drops detections older than two seconds (matching the OBSBOT C++ driver) so the zero-copy fast path resumes as soon as the ML worker stops publishing. Workers are expected to publish every inference — including empty `{"detections": []}` heartbeats — so the driver's freshness timer stays alive between non-empty frames and overlays don't flicker when the scene transiently has nothing to detect.
 
 Overlays are enabled by default on RGB cameras. Set `CYBERWAVE_DETECTION_OVERLAYS=false` to disable. Twins that declare a depth sensor in their capabilities skip this path automatically.
 

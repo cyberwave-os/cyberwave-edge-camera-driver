@@ -159,7 +159,7 @@ def _encode_jpeg(frame: np.ndarray, quality: int = 90) -> bytes:
 #
 # Overlays are RGB-only — depth cameras (RealSense) skip this path.
 
-_DETECTIONS_STALE_MS = 1000  # matches the OBSBOT C++ driver's `> 1000` check
+_DETECTIONS_STALE_MS = 2000  # matches the OBSBOT C++ driver's `> 2000` check
 
 
 @dataclass(slots=True, frozen=True)
