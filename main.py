@@ -17,6 +17,36 @@ Optional env vars:
                                     Automatically disabled for twins that
                                     declare a depth sensor.
 
+  CYBERWAVE_METADATA_FRAME_FILTER_ENABLED
+                                  – "false" (default). When "true" the driver
+                                    subscribes to
+                                    ``cw/<twin_uuid>/data/frames/filtered``
+                                    and substitutes worker-processed
+                                    (e.g. anonymised) frames into the WebRTC
+                                    stream before encoding. Emits a black
+                                    frame when no fresh processed frame is
+                                    available — no raw fallback. Requires
+                                    ``CYBERWAVE_DATA_BACKEND`` to be set (the
+                                    filter depends on the Zenoh data bus to
+                                    receive frames); the driver aborts
+                                    startup otherwise, to avoid a silent
+                                    raw-frame passthrough that would defeat
+                                    the privacy opt-in. See ``frame_filter.py``
+                                    and the README for the full contract.
+
+  CYBERWAVE_METADATA_FRAME_FILTER_FRESHNESS_MS
+                                  – Max age (ms) of a processed frame before
+                                    it is treated as stale and replaced with
+                                    a blank frame. Defaults to 200 ms (tuned
+                                    for >= 5 Hz GPU workers). Raise for CPU
+                                    workers (400-500 ms). Setting 0 forces
+                                    every frame to blank (useful as a fail-
+                                    close test mode). Malformed values fall
+                                    back to the default with a warning. Only
+                                    honoured when
+                                    ``CYBERWAVE_METADATA_FRAME_FILTER_ENABLED``
+                                    is true.
+
 Camera-specific metadata params (set on the twin / asset metadata):
 
   metadata.is_depth_camera  – "true" if the camera is an RGBD/depth camera
@@ -37,6 +67,24 @@ from dataclasses import dataclass
 
 import numpy as np
 from cyberwave import Cyberwave
+
+# Ensure sibling modules (``frame_filter``) are importable when ``main.py`` is
+# loaded via ``importlib.util.spec_from_file_location`` (as the edge-core E2E
+# harness does). Inside the Docker image CWD is ``/app`` so this is a no-op;
+# it only matters for out-of-tree test loaders.
+_DRIVER_DIR = os.path.dirname(os.path.abspath(__file__))
+if _DRIVER_DIR not in sys.path:
+    sys.path.insert(0, _DRIVER_DIR)
+
+from frame_filter import FRESHNESS_MS, FrameFilter  # noqa: E402
+
+try:
+    # Single source of truth for the worker→driver wire contract; workers
+    # import the same constant when publishing. Fallback string keeps the
+    # driver importable against SDK <0.5; remove once the pinned SDK bumps.
+    from cyberwave.data import FILTERED_FRAME_CHANNEL
+except ImportError:
+    FILTERED_FRAME_CHANNEL = "frames/filtered"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -295,6 +343,53 @@ def _detection_overlays_enabled_env() -> bool:
     if raw is None:
         return True
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _frame_filter_enabled_env() -> bool:
+    """Resolve ``CYBERWAVE_METADATA_FRAME_FILTER_ENABLED`` (defaults to disabled).
+
+    Opt-in, not opt-out — a misconfiguration should not silently start
+    blanking WebRTC frames.
+    """
+    raw = os.getenv("CYBERWAVE_METADATA_FRAME_FILTER_ENABLED")
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _enforce_frame_filter_requires_data_bus(
+    *,
+    frame_filter_enabled: bool,
+    data_bus_available: bool,
+) -> None:
+    """Abort startup if the frame filter is requested but the data bus is down.
+
+    Extracted so the invariant can be unit-tested without spinning up the
+    full ``main()`` coroutine.
+
+    The frame filter receives anonymised frames over the Zenoh data bus.
+    Without a bus, the driver's ``frame_callback`` is never installed and
+    the SDK encodes the raw camera frame — which is the exact opposite
+    of the privacy opt-in the operator requested. Fail closed at startup.
+
+    Raises ``SystemExit(1)`` when the filter is enabled but the data bus
+    is unavailable. Returns ``None`` in every other case (filter disabled,
+    or filter enabled with the bus up).
+    """
+    if not frame_filter_enabled:
+        return
+    if data_bus_available:
+        return
+    logger.error(
+        "CYBERWAVE_METADATA_FRAME_FILTER_ENABLED=true but the Zenoh data "
+        "bus is unavailable. The filter depends on the data bus to receive "
+        "anonymised frames; without it the driver would stream raw camera "
+        "frames to WebRTC, defeating the privacy opt-in. Either set "
+        "CYBERWAVE_DATA_BACKEND=zenoh and install eclipse-zenoh "
+        "(`pip install 'cyberwave[camera,zenoh]'`), or set "
+        "CYBERWAVE_METADATA_FRAME_FILTER_ENABLED=false and restart the driver."
+    )
+    sys.exit(1)
 
 
 def _zenoh_publisher_thread(
@@ -576,19 +671,114 @@ async def main() -> None:
     elif data_bus is not None and is_depth_camera:
         logger.info("Detection overlays disabled: depth cameras are not supported")
 
+    # ── Frame-filter subscription ──
+    # Subscribe to ``FILTERED_FRAME_CHANNEL`` (``frames/filtered``) so a
+    # worker-processed ("anonymised") frame can be substituted into the
+    # WebRTC stream before encoding. Driver-side opt-in via the
+    # ``CYBERWAVE_METADATA_FRAME_FILTER_ENABLED`` twin metadata flag.
+    #
+    # When enabled but no fresh, shape-matched processed frame is available,
+    # the driver emits a black frame — fail-closed, no "raw" fallback. See
+    # ``frame_filter.py`` for the full contract.
+    #
+    # NOTE: This is a temporary port from the generic-camera driver in
+    # ``cyberwave-edge-runtime`` so CYB-1716's e2e ships through the
+    # currently-published ``cyberwaveos/camera-driver`` image. Delete this
+    # block (and ``frame_filter.py``) once the generic-camera consolidation
+    # lands and the backend asset registry repoints to that image.
+    frame_filter_enabled = _frame_filter_enabled_env()
+
+    # Privacy-safe fail-closed: if the operator asked for the frame
+    # filter but the data bus is unavailable (CYBERWAVE_DATA_BACKEND
+    # unset, eclipse-zenoh missing, init failure outside zenoh_only,
+    # ...), the driver has no way to receive anonymised frames. The
+    # frame_callback below is only installed when data_bus is not None,
+    # so a silent bring-up would send RAW camera frames to WebRTC —
+    # the exact opposite of what the opt-in requested. The helper
+    # aborts startup with a clear message instead.
+    _enforce_frame_filter_requires_data_bus(
+        frame_filter_enabled=frame_filter_enabled,
+        data_bus_available=data_bus is not None,
+    )
+
+    # Freshness is a soft knob: sensible default exists, so a typo falls
+    # back to the default with a warning (unlike FPS above, which fails
+    # the driver — FPS is a hardware property with no safe guess).
+    # ``FrameFilter.__init__`` already clamps negatives to 0, and a 0
+    # value is a legitimate "force blank frames" test mode — leave both
+    # alone and let the filter do what the operator asked.
+    _raw_freshness = os.getenv("CYBERWAVE_METADATA_FRAME_FILTER_FRESHNESS_MS")
+    try:
+        freshness_ms = float(_raw_freshness) if _raw_freshness else FRESHNESS_MS
+    except ValueError:
+        logger.warning(
+            "Invalid CYBERWAVE_METADATA_FRAME_FILTER_FRESHNESS_MS=%r; "
+            "using default %.0f ms",
+            _raw_freshness,
+            FRESHNESS_MS,
+        )
+        freshness_ms = FRESHNESS_MS
+
+    frame_filter = FrameFilter(
+        channel=FILTERED_FRAME_CHANNEL if frame_filter_enabled else None,
+        freshness_ms=freshness_ms,
+    )
+    frame_filter_subscription = None
+    if data_bus is not None and frame_filter.enabled:
+        try:
+            frame_filter_subscription = data_bus.subscribe(
+                FILTERED_FRAME_CHANNEL,
+                frame_filter.store_processed,
+            )
+            logger.info(
+                "Frame-filter subscriber active on channel '%s' (freshness=%.0f ms)",
+                FILTERED_FRAME_CHANNEL,
+                frame_filter.freshness_s * 1000.0,
+            )
+        except Exception:
+            # Subscription failed even though the bus is up (transient
+            # Zenoh router hiccup, key-expression collision, …). Keep
+            # fail-closed: the frame_filter is still enabled so
+            # ``apply()`` returns a blank frame on every call, and the
+            # dispatched frame_callback below substitutes those blanks
+            # into WebRTC. Log loudly so the operator can investigate
+            # without silently broadcasting raw video.
+            logger.error(
+                "Frame-filter subscription failed; driver will emit blank "
+                "frames until the subscription recovers (fail-closed). Raw "
+                "frames are NOT substituted back in.",
+                exc_info=True,
+            )
+
     def _on_frame(frame: np.ndarray, _frame_count: int) -> None:
-        # Zero-copy fast path when no fresh detections are cached.  Otherwise
-        # copy the frame before drawing so Zenoh subscribers (and ML workers)
-        # only see clean pixels, and mutate the original in place for WebRTC.
+        # Pipeline order (all optional, flagged independently):
+        #   1. Stage the raw captured frame into ``frame_slot`` so the Zenoh
+        #      publisher thread always sees clean pixels.
+        #   2. If the frame-filter is enabled, substitute the worker's
+        #      processed frame (or a black frame when stale) into ``frame``
+        #      in place — WebRTC encodes whatever ``frame`` holds at return.
+        #   3. If detections are cached, draw YOLO-style boxes on top.
+        # Zero-copy fast path when no in-place mutation will happen.
         if frame_slot is None:
             return
         snap = detection_cache.snapshot() if detection_cache is not None else None
-        if snap is None:
+        will_mutate = frame_filter.enabled or snap is not None
+        if will_mutate:
+            # Copy first so Zenoh subscribers (and ML workers) always see
+            # the raw pixels, regardless of what we do to ``frame`` below.
+            frame_slot.put(frame.copy())
+        else:
             frame_slot.put(frame)
             return
-        frame_slot.put(frame.copy())
-        boxes, det_w, det_h = snap
-        _draw_detections(frame, boxes, det_w, det_h)
+
+        if frame_filter.enabled:
+            replacement = frame_filter.apply(frame)
+            if replacement is not None:
+                np.copyto(frame, replacement)
+
+        if snap is not None:
+            boxes, det_w, det_h = snap
+            _draw_detections(frame, boxes, det_w, det_h)
 
     frame_callback = _on_frame if data_bus is not None else None
 
@@ -664,6 +854,11 @@ async def main() -> None:
                 detection_subscription.close()
             except Exception:
                 logger.debug("Detection subscription close failed", exc_info=True)
+        if frame_filter_subscription is not None:
+            try:
+                frame_filter_subscription.close()
+            except Exception:
+                logger.debug("Frame-filter subscription close failed", exc_info=True)
         stop_publisher.set()
         if publisher_thread is not None:
             publisher_thread.join(timeout=5.0)

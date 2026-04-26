@@ -71,6 +71,8 @@ Injected by `cyberwave-edge-core` at runtime:
 | `CYBERWAVE_FRAME_ENCODING`        | `raw` (default) for numpy arrays via SHM, or `jpeg` for JPEG-encoded frames (lower bandwidth)  |
 | `CYBERWAVE_FRAME_JPEG_QUALITY`    | JPEG quality 1-100 when encoding is `jpeg` (default: `90`)                                     |
 | `CYBERWAVE_DETECTION_OVERLAYS`    | `true` (default) to draw YOLO bounding boxes from the `detections/*` Zenoh channel on the WebRTC stream. Set to `false` to disable. Ignored on depth cameras. |
+| `CYBERWAVE_METADATA_FRAME_FILTER_ENABLED` | `false` (default). Set to `true` to subscribe to the `frames/filtered` Zenoh channel and substitute worker-processed (e.g. anonymised/pixelated) frames into the WebRTC stream before encoding. When enabled, emits a black frame if no fresh processed frame is available — privacy-safe by default, no raw fallback. |
+| `CYBERWAVE_METADATA_FRAME_FILTER_FRESHNESS_MS` | Max age (ms) of a processed frame before it is treated as stale and replaced with a blank frame. Default: `200` (tuned for ≥ 5 Hz GPU workers). Raise to `400`–`500` for CPU-only workers; higher values keep more visibly-stale frames on screen and weaken the privacy contract. `0` is a valid "force blank" fail-close test mode. Only honoured when `CYBERWAVE_METADATA_FRAME_FILTER_ENABLED=true`. |
 
 ## Zenoh data bus
 
@@ -108,6 +110,33 @@ Coordinates are in pixel space of the detection frame; the driver scales them to
 Overlays are enabled by default on RGB cameras. Set `CYBERWAVE_DETECTION_OVERLAYS=false` to disable. Twins that declare a depth sensor in their capabilities skip this path automatically.
 
 The driver depends on `cyberwave[camera,zenoh]`, which pulls in `eclipse-zenoh`. If the data bus cannot be opened at startup (for example, the router is unreachable) the driver logs an error pointing at the missing dependency and — when `CYBERWAVE_PUBLISH_MODE=zenoh_only` — exits rather than silently falling back to WebRTC-only.
+
+## Frame filter (anonymisation pipeline)
+
+When `CYBERWAVE_METADATA_FRAME_FILTER_ENABLED=true`, the driver subscribes to `cw/<twin_uuid>/data/frames/filtered` and swaps worker-processed frames (e.g. pixelated or redacted people) into the WebRTC stream before encoding. Raw frames on `frames/<sensor>` are **unchanged** — workers always receive clean pixels.
+
+Workers publish processed frames using the SDK's `FILTERED_FRAME_CHANNEL` constant:
+
+```python
+import cyberwave as cw
+from cyberwave.data import FILTERED_FRAME_CHANNEL
+
+@cw.on_frame(TWIN_UUID, sensor="color_camera")
+def anonymise(ctx: cw.HookContext):
+    persons = cw.models.load("yolov8n").predict(ctx.frame)
+    anonymised = cw.vision.anonymize_frame(ctx.frame, persons, mode="pixelate")
+    cw.data.publish(FILTERED_FRAME_CHANNEL, anonymised)
+```
+
+Privacy-safe defaults:
+
+- The filter depends on the Zenoh data bus to receive anonymised frames. If `CYBERWAVE_METADATA_FRAME_FILTER_ENABLED=true` but `CYBERWAVE_DATA_BACKEND` is unset or the bus fails to come up (e.g. `eclipse-zenoh` is missing from the image), the driver **aborts startup with exit code 1** rather than silently streaming raw camera frames to WebRTC. Set `CYBERWAVE_DATA_BACKEND=zenoh` and install `cyberwave[camera,zenoh]`, or disable the filter.
+- Processed frames are considered "fresh" for **200 ms** by default. Beyond that the driver emits a black frame — there is no raw fallback, so if your worker is slower than ~5 Hz the stream will appear blacked out. Either budget your inference accordingly (GPU, lighter model, smaller `imgsz`) or raise `CYBERWAVE_METADATA_FRAME_FILTER_FRESHNESS_MS` (e.g. to `400`–`500` ms) at the cost of keeping visibly-stale anonymised frames on screen longer.
+- Shape or dtype mismatches between raw and processed frames also emit black and log a warning once every 30 s.
+- Subscription failures after startup (transient Zenoh router hiccups) also keep the stream blacked out rather than falling back to raw, and log an `ERROR` so the operator can investigate.
+- Detection overlays (if enabled) are drawn **on top of** the filtered frame, so bounding boxes still appear even when the underlying pixels are pixelated. If this defeats your anonymisation requirement, set `CYBERWAVE_DETECTION_OVERLAYS=false` alongside the filter flag.
+
+> **Note:** `frame_filter.py` in this package is a temporary port of the same module in `cyberwave-edge-runtime/runtime-services/drivers/native/cyberwave/generic-camera`. Once that driver image is published and the backend asset registry repoints to it, the copy here should be removed.
 
 ## Failure signaling
 
