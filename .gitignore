@@ -207,3 +207,14 @@ marimo/_lsp/
 __marimo__/
 
 .DS_Store
+
+# Docker build scratch
+#   ``sdk-local/`` is created by CI (or a developer running a local Docker
+#   build) to vendor the in-tree ``cyberwave-sdks/cyberwave-python`` source
+#   into the image when the published wheel on PyPI is too old. The
+#   Dockerfile's ``COPY sdk-local /tmp/sdk-local`` requires the directory
+#   to exist, so CI runs ``mkdir -p sdk-local`` before the build and
+#   ``rm -rf sdk-local`` after — see
+#   ``.github/workflows/edge-node-camera-driver-test-and-push.yml``.
+#   Its contents are pure build scratch and must never be committed.
+sdk-local/

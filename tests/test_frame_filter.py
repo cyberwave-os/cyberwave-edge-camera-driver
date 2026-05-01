@@ -106,45 +106,109 @@ class TestShapeAndDtypeMismatch:
         assert (out == 0).all()
 
     def test_mismatch_is_logged_with_diagnostics(self, caplog):
-        f = FrameFilter(channel="frames/filtered", stale_log_s=0.0001)
+        f = FrameFilter(channel="frames/filtered", stale_log_s=1.0)
         f.slot.put(np.zeros((60, 80, 3), dtype=np.uint8))
+        # Pre-expire the window so the next apply flushes its summary.
+        f._stats.start_ts -= 10_000.0
         with caplog.at_level(logging.WARNING, logger="frame_filter"):
             f.apply(_frame())
-        assert any("mismatch" in r.message for r in caplog.records), [
+        assert any("shape_mismatch" in r.message for r in caplog.records), [
             r.message for r in caplog.records
         ]
 
 
-class TestStaleLogRateLimit:
-    def test_logs_only_once_within_window(self, caplog):
-        f = FrameFilter(
-            channel="frames/filtered",
-            freshness_ms=10,
-            stale_log_s=60.0,  # large window -> at most one log
-        )
+class TestBlankFrameSummaryLog:
+    """The window-expiry summary log replaces the old per-stale warning."""
 
+    def test_no_log_until_window_expires(self, caplog):
+        f = FrameFilter(channel="frames/filtered", freshness_ms=10, stale_log_s=60.0)
         with caplog.at_level(logging.WARNING, logger="frame_filter"):
             for _ in range(5):
                 f.apply(_frame())
+        stale_logs = [r for r in caplog.records if "[FRAME_FILTER]" in r.message]
+        assert stale_logs == [], [r.message for r in caplog.records]
 
+    def test_one_summary_per_window(self, caplog):
+        f = FrameFilter(channel="frames/filtered", freshness_ms=10, stale_log_s=30.0)
+        with caplog.at_level(logging.WARNING, logger="frame_filter"):
+            for _ in range(3):
+                f.apply(_frame())
+            # Force the window to expire; the next apply flushes one summary.
+            f._stats.start_ts -= 10_000.0
+            f.apply(_frame())
+            # Subsequent applies in the new window should NOT re-log.
+            for _ in range(3):
+                f.apply(_frame())
         stale_logs = [r for r in caplog.records if "[FRAME_FILTER]" in r.message]
         assert len(stale_logs) == 1, [r.message for r in caplog.records]
 
     def test_emits_again_after_window_elapses(self, caplog):
-        f = FrameFilter(
-            channel="frames/filtered",
-            freshness_ms=10,
-            stale_log_s=30.0,
-        )
-
+        f = FrameFilter(channel="frames/filtered", freshness_ms=10, stale_log_s=30.0)
         with caplog.at_level(logging.WARNING, logger="frame_filter"):
-            f.apply(_frame())
-            # Force the next call past the rate-limit window.
-            f._last_stale_log_ts -= 10_000.0
-            f.apply(_frame())
-
+            for _ in range(2):
+                f._stats.start_ts -= 10_000.0
+                f.apply(_frame())
         stale_logs = [r for r in caplog.records if "[FRAME_FILTER]" in r.message]
         assert len(stale_logs) == 2, [r.message for r in caplog.records]
+
+    def test_no_log_when_no_blanks_in_window(self, caplog):
+        # Worker is healthy: every apply gets a fresh, well-formed frame.
+        f = FrameFilter(channel="frames/filtered", freshness_ms=200, stale_log_s=30.0)
+        with caplog.at_level(logging.WARNING, logger="frame_filter"):
+            for _ in range(5):
+                f.slot.put(_frame(value=42))
+                f.apply(_frame())
+            f._stats.start_ts -= 10_000.0
+            f.slot.put(_frame(value=42))
+            f.apply(_frame())
+        stale_logs = [r for r in caplog.records if "[FRAME_FILTER]" in r.message]
+        assert stale_logs == [], [r.message for r in caplog.records]
+
+    def test_summary_includes_percentage_and_count(self, caplog):
+        f = FrameFilter(channel="frames/filtered", freshness_ms=200, stale_log_s=30.0)
+        with caplog.at_level(logging.WARNING, logger="frame_filter"):
+            # 1 healthy frame, then 9 with a forced-stale slot.
+            f.slot.put(_frame(value=42))
+            f.apply(_frame())
+            for _ in range(9):
+                f.slot.timestamp -= 10.0
+                f.apply(_frame())
+            # Force the window to expire and flush a summary on the next apply.
+            f._stats.start_ts -= 10_000.0
+            f.apply(_frame())
+        flush_records = [r for r in caplog.records if "[FRAME_FILTER]" in r.message]
+        assert flush_records, "expected at least one [FRAME_FILTER] summary log"
+        msg = flush_records[-1].message
+        assert "%" in msg
+        assert "stale=" in msg
+        assert "frames in last" in msg
+
+    def test_high_blank_rate_uses_dead_worker_advice(self, caplog):
+        f = FrameFilter(channel="frames/filtered", freshness_ms=10, stale_log_s=30.0)
+        with caplog.at_level(logging.WARNING, logger="frame_filter"):
+            for _ in range(10):
+                f.apply(_frame())
+            f._stats.start_ts -= 10_000.0
+            f.apply(_frame())
+        stale_logs = [r for r in caplog.records if "[FRAME_FILTER]" in r.message]
+        assert stale_logs, [r.message for r in caplog.records]
+        assert "Worker likely down" in stale_logs[-1].message
+
+    def test_low_blank_rate_uses_freshness_advice(self, caplog):
+        f = FrameFilter(channel="frames/filtered", freshness_ms=200, stale_log_s=30.0)
+        with caplog.at_level(logging.WARNING, logger="frame_filter"):
+            # 99 healthy + 1 stale = 1% blank.
+            for _ in range(99):
+                f.slot.put(_frame(value=42))
+                f.apply(_frame())
+            f.slot.timestamp -= 10.0  # force the next read to be stale
+            f.apply(_frame())
+            f._stats.start_ts -= 10_000.0
+            f.slot.put(_frame(value=42))
+            f.apply(_frame())  # flush
+        stale_logs = [r for r in caplog.records if "[FRAME_FILTER]" in r.message]
+        assert stale_logs, [r.message for r in caplog.records]
+        assert "freshness window too tight" in stale_logs[-1].message
 
 
 class TestProcessedFrameDispatch:

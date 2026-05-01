@@ -132,9 +132,31 @@ Privacy-safe defaults:
 
 - The filter depends on the Zenoh data bus to receive anonymised frames. If `CYBERWAVE_METADATA_FRAME_FILTER_ENABLED=true` but `CYBERWAVE_DATA_BACKEND` is unset or the bus fails to come up (e.g. `eclipse-zenoh` is missing from the image), the driver **aborts startup with exit code 1** rather than silently streaming raw camera frames to WebRTC. Set `CYBERWAVE_DATA_BACKEND=zenoh` and install `cyberwave[camera,zenoh]`, or disable the filter.
 - Processed frames are considered "fresh" for **200 ms** by default. Beyond that the driver emits a black frame — there is no raw fallback, so if your worker is slower than ~5 Hz the stream will appear blacked out. Either budget your inference accordingly (GPU, lighter model, smaller `imgsz`) or raise `CYBERWAVE_METADATA_FRAME_FILTER_FRESHNESS_MS` (e.g. to `400`–`500` ms) at the cost of keeping visibly-stale anonymised frames on screen longer.
-- Shape or dtype mismatches between raw and processed frames also emit black and log a warning once every 30 s.
+- Shape or dtype mismatches between raw and processed frames also emit black and are accumulated into the blank-frame summary log (see below).
 - Subscription failures after startup (transient Zenoh router hiccups) also keep the stream blacked out rather than falling back to raw, and log an `ERROR` so the operator can investigate.
 - Detection overlays (if enabled) are drawn **on top of** the filtered frame, so bounding boxes still appear even when the underlying pixels are pixelated. If this defeats your anonymisation requirement, set `CYBERWAVE_DETECTION_OVERLAYS=false` alongside the filter flag.
+
+#### Blank-frame summary log
+
+Stale and shape/dtype-mismatch fall-throughs are accumulated into a 30-second rolling window and logged as a single summary per window:
+
+```
+[FRAME_FILTER] 1.2% of 870 frames in last 30 s emitted blank fallback on
+'frames/filtered' (reasons: stale=11). Worker may be slow or freshness
+window too tight; consider raising
+CYBERWAVE_METADATA_FRAME_FILTER_FRESHNESS_MS if pixelation occasionally
+drops out.
+```
+
+A high blank rate switches the advice line:
+
+```
+[FRAME_FILTER] 100.0% of 900 frames in last 30 s emitted blank fallback on
+'frames/filtered' (reasons: stale=900). Worker likely down or not
+publishing on this channel — check the worker container logs.
+```
+
+The previous design fired one warning the moment any frame went stale and then suppressed further warnings for the rest of the window — that fired loudly even when 99% of frames were fine, which happens routinely when the worker publishes at 5 fps and the driver polls at 30 fps with the default 200 ms freshness window. The summary form lets operators distinguish "occasional jitter" (~1%) from "worker is down" (~100%).
 
 > **Note:** `frame_filter.py` in this package is a temporary port of the same module in `cyberwave-edge-runtime/runtime-services/drivers/native/cyberwave/generic-camera`. Once that driver image is published and the backend asset registry repoints to it, the copy here should be removed.
 
