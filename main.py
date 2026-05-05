@@ -845,8 +845,24 @@ async def main() -> None:
                 raise HardwareConnectionError(
                     f"Camera hardware unavailable: could not start stream with fallback '{fallback_camera_id}'"
                 ) from fallback_error
-        logger.info("Camera stream started. Waiting for shutdown signal...")
-        await stop_event.wait()
+        logger.info("Camera stream started. Running auto-reconnect loop until shutdown...")
+        # Hand off to the SDK's reconnection loop: it monitors WebRTC
+        # connectionState and republishes a new offer when the consumer
+        # tab/network drops the peer connection. Without this the camera
+        # would stream for one session and then go dark until the driver
+        # is restarted.
+        #
+        # ``stream_video_background`` (called above) calls ``streamer.start()``
+        # but does not arm the reconnect monitor — only ``stream_video`` and
+        # the ``CameraStreamManager`` flip ``_should_reconnect`` after starting.
+        # ``run_with_auto_reconnect`` itself only arms the monitor on the
+        # branch where it has to call ``start()`` itself (i.e. ``pc is None``
+        # at entry), so when we pre-seed the connection here the monitor
+        # observes ``_should_reconnect == False`` and never re-offers after a
+        # disconnect. Set the flag explicitly so the monitor task does its job.
+        streamer = camera.streamer()
+        streamer._should_reconnect = streamer.auto_reconnect
+        await streamer.run_with_auto_reconnect(stop_event=stop_event)
     finally:
         logger.info("Stopping camera stream...")
         if detection_subscription is not None:
