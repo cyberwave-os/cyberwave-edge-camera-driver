@@ -80,11 +80,12 @@ from frame_filter import FRESHNESS_MS, FrameFilter  # noqa: E402
 
 try:
     # Single source of truth for the worker→driver wire contract; workers
-    # import the same constant when publishing. Fallback string keeps the
+    # import the same constants when publishing. Fallback strings keep the
     # driver importable against SDK <0.5; remove once the pinned SDK bumps.
-    from cyberwave.data import FILTERED_FRAME_CHANNEL
+    from cyberwave.data import FILTERED_FRAME_CHANNEL, FRAME_OVERLAY_CHANNEL
 except ImportError:
     FILTERED_FRAME_CHANNEL = "frames/filtered"
+    FRAME_OVERLAY_CHANNEL = "frames/overlay"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -343,6 +344,170 @@ def _detection_overlays_enabled_env() -> bool:
     if raw is None:
         return True
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+# ── Workflow overlay (annotate-node-driven) ─────────────────────────
+#
+# The ``annotate`` workflow node publishes a JSON spec to
+# ``FRAME_OVERLAY_CHANNEL`` (``frames/overlay``) that carries the
+# user's styling parameters (``line_width``, ``font_scale``, label
+# filter) on top of the raw detection list. The driver caches the
+# latest payload per twin and composites it onto every frame
+# pre-encode, *unconditionally* — overlay is additive, not pixel
+# substitution, so it doesn't ride the privacy-fail-closed
+# ``frame_filter_enabled`` gate that ``anonymize`` uses.
+#
+# When a fresh overlay payload is present it preempts the legacy
+# raw-``detections/<runtime>`` overlay so the user's styling wins.
+# When stale or absent, the driver falls back to ``_draw_detections``.
+
+
+class _OverlayCache:
+    """Thread-safe holder for the most recent overlay payload.
+
+    ``payload`` is the dict returned by
+    :func:`cyberwave.vision.build_overlay_payload`. Returns ``None``
+    from :meth:`snapshot` when the cache is empty or the last update
+    is older than :data:`_DETECTIONS_STALE_MS` (same TTL as the raw
+    detection cache, keeping the two paths feel-equivalent to the
+    operator).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._payload: dict | None = None
+        self._updated_at = 0.0
+
+    def update(self, payload: dict) -> None:
+        with self._lock:
+            self._payload = payload
+            self._updated_at = time.monotonic()
+
+    def snapshot(self) -> dict | None:
+        with self._lock:
+            if self._payload is None:
+                return None
+            if (time.monotonic() - self._updated_at) * 1000.0 > _DETECTIONS_STALE_MS:
+                return None
+            # Defensive shallow copy — mirrors ``_DetectionCache.snapshot``
+            # so a misbehaving caller can't mutate the cached dict (e.g.
+            # by sorting the boxes list in place) and corrupt subsequent
+            # reads on the encoder thread.
+            return dict(self._payload)
+
+
+def _validate_overlay_payload(data: object) -> dict | None:
+    """Schema-check an already-decoded overlay payload.
+
+    The Zenoh subscriber gets the decoded dict directly from the data
+    bus (``cw.data.publish`` writes a CONTENT_TYPE_JSON envelope and
+    ``cw.data.subscribe`` strips the header + ``json.loads`` it), so
+    the validation step doesn't need to know about wire bytes at all.
+    Kept separate from :func:`_parse_overlay_payload` so the bytes-in
+    test entry point stays usable.
+    """
+    if not isinstance(data, dict):
+        return None
+    # ``v == 1`` is the only schema this driver knows; anything else
+    # is silently dropped so future bumps remain forward-compatible
+    # (the worker keeps publishing, just nothing renders here).
+    if data.get("v") != 1:
+        return None
+    if not isinstance(data.get("boxes"), list):
+        return None
+    return data
+
+
+def _parse_overlay_payload(payload: bytes) -> dict | None:
+    """Decode + validate an overlay JSON payload from raw bytes.
+
+    Used by tests that want to exercise the full bytes-in / dict-out
+    round-trip without spinning up a data bus. The driver subscriber
+    callback uses :func:`_validate_overlay_payload` directly because
+    ``cw.data.subscribe`` already hands back a decoded dict.
+    """
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError):
+        logger.debug("Failed to parse overlay payload", exc_info=True)
+        return None
+    return _validate_overlay_payload(data)
+
+
+def _draw_overlay(frame: np.ndarray, payload: dict) -> None:
+    """Draw the overlay payload's boxes + captions on ``frame`` in place.
+
+    Mirrors :func:`_draw_detections` visually (same green palette and
+    label-clamp behaviour) but reads the styling from the payload's
+    ``style`` block so the workflow author's ``line_width`` /
+    ``font_scale`` choices in the ``annotate`` node actually take
+    effect at the driver. Coordinates in the payload are in the
+    original frame's pixel space; the driver clamps them to its own
+    encode resolution.
+    """
+    import cv2
+
+    boxes = payload.get("boxes") or []
+    if not boxes:
+        return
+    style = payload.get("style") or {}
+    line_width = max(0, int(style.get("line_width", 2) or 0))
+    font_scale = float(style.get("font_scale", 0.5) or 0.0)
+    show_confidence = bool(style.get("show_confidence", True))
+
+    h, w = frame.shape[:2]
+    for box in boxes:
+        coords = box.get("box_2d")
+        if not isinstance(coords, list | tuple) or len(coords) != 4:
+            continue
+        try:
+            x1 = max(0, min(int(coords[0]), w - 1))
+            y1 = max(0, min(int(coords[1]), h - 1))
+            x2 = max(0, min(int(coords[2]), w - 1))
+            y2 = max(0, min(int(coords[3]), h - 1))
+        except (TypeError, ValueError):
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        if line_width > 0:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), line_width)
+
+        if font_scale <= 0:
+            continue
+
+        label_text = str(box.get("label", "?"))
+        if show_confidence:
+            try:
+                conf = float(box.get("conf", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            label_text = f"{label_text} {conf * 100.0:.0f}%"
+        text_thickness = max(1, line_width // 2 if line_width > 0 else 1)
+        (text_w, text_h), _baseline = cv2.getTextSize(
+            label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_thickness
+        )
+        if y1 - text_h - 6 >= 0:
+            bg_top, bg_bottom, text_y = y1 - text_h - 6, y1, y1 - 4
+        else:
+            bg_top, bg_bottom, text_y = y1, y1 + text_h + 6, y1 + text_h + 2
+        cv2.rectangle(
+            frame,
+            (x1, bg_top),
+            (x1 + text_w + 4, bg_bottom),
+            (0, 255, 0),
+            cv2.FILLED,
+        )
+        cv2.putText(
+            frame,
+            label_text,
+            (x1 + 2, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (0, 0, 0),
+            text_thickness,
+            cv2.LINE_AA,
+        )
 
 
 def _frame_filter_enabled_env() -> bool:
@@ -631,8 +796,17 @@ async def main() -> None:
     # (ultralytics, onnxruntime, ...) can push YOLO-style results that the
     # driver draws on the WebRTC stream.  Same payload schema as the C++
     # OBSBOT driver.
+    #
+    # Two overlay sources coexist:
+    #   - This raw ``detections/**`` channel: fallback path that draws
+    #     whatever the model detected, in the driver's default style.
+    #   - ``FRAME_OVERLAY_CHANNEL`` (below): the ``annotate`` workflow
+    #     node's styled spec. When fresh, it preempts the raw fallback
+    #     so the author's ``line_width`` / ``font_scale`` choices win.
     detection_cache: _DetectionCache | None = None
     detection_subscription = None
+    overlay_cache: _OverlayCache | None = None
+    overlay_subscription = None
     if data_bus is not None and not is_depth_camera and _detection_overlays_enabled_env():
         try:
             from cyberwave.data.backend import Sample
@@ -670,6 +844,52 @@ async def main() -> None:
             detection_subscription = None
     elif data_bus is not None and is_depth_camera:
         logger.info("Detection overlays disabled: depth cameras are not supported")
+
+    # Workflow overlay subscription is independent of:
+    #   - ``frame_filter_enabled`` (overlay is additive, not pixel
+    #     substitution, so the privacy fail-closed gate doesn't apply).
+    #   - ``CYBERWAVE_DETECTION_OVERLAYS`` (that flag toggles the raw
+    #     ``detections/<runtime>`` fallback; the annotate channel is a
+    #     separate, intentional surface — operators set the env var to
+    #     turn off the *fallback* and rely on annotate, not the other
+    #     way around).
+    # Depth cameras are still excluded — colour overlays don't make
+    # sense over a depth heatmap and the current draw helper is BGR.
+    if data_bus is not None and not is_depth_camera:
+        try:
+            local_overlay = _OverlayCache()
+
+            def _on_overlay_decoded(decoded: object) -> None:
+                # ``data_bus.subscribe(channel, cb)`` (default
+                # ``raw=False``) decodes the wire envelope and hands
+                # ``cb`` the deserialised payload — a ``dict`` for our
+                # CONTENT_TYPE_JSON publish. Validate the schema and
+                # cache; ignore unknown shapes / future schema bumps so
+                # a worker upgrade doesn't crash the driver.
+                parsed = _validate_overlay_payload(decoded)
+                if parsed is None:
+                    return
+                local_overlay.update(parsed)
+
+            overlay_subscription = data_bus.subscribe(
+                FRAME_OVERLAY_CHANNEL,
+                _on_overlay_decoded,
+            )
+            overlay_cache = local_overlay
+            logger.info(
+                "Workflow overlay subscriber active on channel '%s'",
+                FRAME_OVERLAY_CHANNEL,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Workflow overlay subscription failed (%s: %s); annotate-node "
+                "overlays disabled (raw detections fallback unaffected)",
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            overlay_cache = None
+            overlay_subscription = None
 
     # ── Frame-filter subscription ──
     # Subscribe to ``FILTERED_FRAME_CHANNEL`` (``frames/filtered``) so a
@@ -757,12 +977,23 @@ async def main() -> None:
         #   2. If the frame-filter is enabled, substitute the worker's
         #      processed frame (or a black frame when stale) into ``frame``
         #      in place — WebRTC encodes whatever ``frame`` holds at return.
-        #   3. If detections are cached, draw YOLO-style boxes on top.
+        #   3. If a workflow overlay is fresh, composite it on top
+        #      (the ``annotate`` node's styled spec). Otherwise fall
+        #      back to the raw ``detections/<runtime>`` cache.
         # Zero-copy fast path when no in-place mutation will happen.
         if frame_slot is None:
             return
-        snap = detection_cache.snapshot() if detection_cache is not None else None
-        will_mutate = frame_filter.enabled or snap is not None
+        overlay_payload = (
+            overlay_cache.snapshot() if overlay_cache is not None else None
+        )
+        snap = (
+            detection_cache.snapshot()
+            if detection_cache is not None and overlay_payload is None
+            else None
+        )
+        will_mutate = (
+            frame_filter.enabled or overlay_payload is not None or snap is not None
+        )
         if will_mutate:
             # Copy first so Zenoh subscribers (and ML workers) always see
             # the raw pixels, regardless of what we do to ``frame`` below.
@@ -776,7 +1007,9 @@ async def main() -> None:
             if replacement is not None:
                 np.copyto(frame, replacement)
 
-        if snap is not None:
+        if overlay_payload is not None:
+            _draw_overlay(frame, overlay_payload)
+        elif snap is not None:
             boxes, det_w, det_h = snap
             _draw_detections(frame, boxes, det_w, det_h)
 
@@ -870,6 +1103,11 @@ async def main() -> None:
                 detection_subscription.close()
             except Exception:
                 logger.debug("Detection subscription close failed", exc_info=True)
+        if overlay_subscription is not None:
+            try:
+                overlay_subscription.close()
+            except Exception:
+                logger.debug("Overlay subscription close failed", exc_info=True)
         if frame_filter_subscription is not None:
             try:
                 frame_filter_subscription.close()

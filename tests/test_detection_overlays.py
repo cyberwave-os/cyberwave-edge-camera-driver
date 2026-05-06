@@ -18,7 +18,11 @@ from main import (
     _detection_overlays_enabled_env,
     _DetectionCache,
     _draw_detections,
+    _draw_overlay,
+    _OverlayCache,
     _parse_detections_payload,
+    _parse_overlay_payload,
+    _validate_overlay_payload,
 )
 
 # ── _parse_detections_payload ──────────────────────────────────────
@@ -225,3 +229,198 @@ def test_overlays_disabled_values(monkeypatch: pytest.MonkeyPatch, value: str) -
 def test_overlays_truthy_or_unset_enabled(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("CYBERWAVE_DETECTION_OVERLAYS", value)
     assert _detection_overlays_enabled_env() is True
+
+
+# ── Workflow overlay (annotate-node) ───────────────────────────────
+
+
+def _overlay_payload_bytes(
+    *,
+    boxes: list[dict] | None = None,
+    line_width: int = 4,
+    font_scale: float = 0.5,
+    show_confidence: bool = True,
+) -> bytes:
+    """Build a v1-schema overlay payload matching what
+    ``cyberwave.vision.build_overlay_payload`` produces. Kept inline
+    so the test doesn't have to import the SDK."""
+    return json.dumps(
+        {
+            "v": 1,
+            "boxes": boxes
+            if boxes is not None
+            else [{"box_2d": [10.0, 20.0, 110.0, 120.0], "label": "person", "conf": 0.92}],
+            "style": {
+                "line_width": line_width,
+                "font_scale": font_scale,
+                "show_confidence": show_confidence,
+            },
+        }
+    ).encode()
+
+
+def test_parse_overlay_valid_payload_round_trips_style() -> None:
+    parsed = _parse_overlay_payload(_overlay_payload_bytes())
+    assert parsed is not None
+    assert parsed["v"] == 1
+    assert parsed["boxes"][0]["label"] == "person"
+    assert parsed["style"]["line_width"] == 4
+
+
+def test_parse_overlay_rejects_unknown_schema_version() -> None:
+    # Forward-compat: a future bump must not crash, just stop drawing.
+    payload = json.dumps({"v": 99, "boxes": [], "style": {}}).encode()
+    assert _parse_overlay_payload(payload) is None
+
+
+def test_parse_overlay_rejects_invalid_json_or_shape() -> None:
+    assert _parse_overlay_payload(b"not json") is None
+    assert _parse_overlay_payload(b"[]") is None  # not a dict
+    assert _parse_overlay_payload(b'{"v":1,"boxes":"oops"}') is None
+
+
+def test_overlay_cache_returns_fresh_then_stale() -> None:
+    cache = _OverlayCache()
+    assert cache.snapshot() is None
+    cache.update({"v": 1, "boxes": [], "style": {}})
+    assert cache.snapshot() is not None
+    with patch("main.time.monotonic", return_value=time.monotonic() + 5.0):
+        assert cache.snapshot() is None
+
+
+def test_draw_overlay_respects_payload_line_width() -> None:
+    pytest.importorskip("cv2")
+    import cv2
+
+    frame = np.zeros((200, 300, 3), dtype=np.uint8)
+    payload = json.loads(_overlay_payload_bytes(line_width=7, font_scale=0))
+    with patch.object(cv2, "rectangle", wraps=cv2.rectangle) as mock_rect:
+        _draw_overlay(frame, payload)
+    # ``font_scale=0`` skips the caption pass, so the only rectangle
+    # call is the bbox itself — and its thickness must come from the
+    # payload, not a driver-side default.
+    args, _kwargs = mock_rect.call_args_list[0]
+    _frame_arg, pt1, pt2, _color, thickness = args
+    assert pt1 == (10, 20)
+    assert pt2 == (110, 120)
+    assert thickness == 7
+
+
+def test_draw_overlay_skips_zero_area_and_unknown_box_shape() -> None:
+    pytest.importorskip("cv2")
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    payload = json.loads(
+        _overlay_payload_bytes(
+            boxes=[
+                {"box_2d": [10, 10, 10, 10], "label": "a", "conf": 0.5},  # zero area
+                {"box_2d": [10, 10, 5, 5], "label": "b", "conf": 0.5},  # inverted
+                {"box_2d": [10, 10], "label": "c", "conf": 0.5},  # malformed
+            ]
+        )
+    )
+    _draw_overlay(frame, payload)
+    # No drawable boxes → frame stays untouched.
+    assert (frame == 0).all()
+
+
+def test_overlay_cache_snapshot_returns_defensive_copy() -> None:
+    """Mirrors ``test_cache_snapshot_returns_defensive_copy`` for the
+    detection cache. A caller that mutates the snapshot dict (e.g.
+    ``parsed["boxes"].sort(...)``) must not corrupt the cache that the
+    encoder thread reads on the next frame."""
+    cache = _OverlayCache()
+    cache.update({"v": 1, "boxes": [{"label": "person"}], "style": {}})
+
+    snap = cache.snapshot()
+    assert snap is not None
+    snap.clear()  # would corrupt the cache if returned by reference
+
+    snap_again = cache.snapshot()
+    assert snap_again is not None
+    assert snap_again["v"] == 1, "mutation through snapshot leaked into cache"
+
+
+# ── Subscriber callback contract: bus delivers decoded dicts ───────
+
+
+def test_validate_overlay_payload_accepts_decoded_dict() -> None:
+    """Documents the contract: ``data_bus.subscribe`` (default
+    ``raw=False``) hands the callback the **decoded dict**, not a
+    ``Sample`` with raw bytes. Validate accepts the dict directly so
+    the subscriber wiring matches the bus's actual delivery format."""
+    decoded = {
+        "v": 1,
+        "boxes": [{"box_2d": [10, 20, 100, 200], "label": "person", "conf": 0.9}],
+        "style": {"line_width": 2, "font_scale": 0.5, "show_confidence": True},
+    }
+    parsed = _validate_overlay_payload(decoded)
+    assert parsed is not None
+    assert parsed["boxes"][0]["label"] == "person"
+
+
+def test_validate_overlay_payload_rejects_non_dict_and_unknown_schema() -> None:
+    assert _validate_overlay_payload("not a dict") is None
+    assert _validate_overlay_payload(None) is None
+    assert _validate_overlay_payload({"v": 99, "boxes": []}) is None
+    assert _validate_overlay_payload({"v": 1, "boxes": "oops"}) is None
+
+
+def test_subscribe_publish_round_trip_updates_cache() -> None:
+    """End-to-end regression for the wire contract: a worker calling
+    ``cw.data.publish(FRAME_OVERLAY_CHANNEL, build_overlay_payload(...))``
+    must drive the driver's overlay cache via the SAME callback
+    signature the driver registers in ``main.py``.
+
+    This test would have caught the original bug where the callback
+    expected ``sample.payload`` (raw bytes) but the bus delivers the
+    already-decoded dict."""
+    pytest.importorskip("cyberwave.data")
+
+    from cyberwave.data import FRAME_OVERLAY_CHANNEL
+    from cyberwave.data.api import DataBus
+    from cyberwave.data.backend import DataBackend, Sample, Subscription
+
+    class _MemBackend(DataBackend):
+        """Synchronous in-process backend — invokes subscribers inline
+        on publish so the round-trip is deterministic with no thread."""
+
+        def __init__(self) -> None:
+            self._subs: dict[str, list] = {}
+
+        def publish(self, channel, payload, *, metadata=None):
+            for cb in self._subs.get(channel, []):
+                cb(Sample(channel=channel, payload=payload, metadata=metadata))
+
+        def subscribe(self, channel, callback, *, policy="latest"):
+            self._subs.setdefault(channel, []).append(callback)
+            return Subscription()
+
+        def latest(self, channel, *, timeout_s=1.0):
+            return None
+
+        def close(self) -> None: ...
+
+    bus = DataBus(_MemBackend(), twin_uuid="00000000-0000-0000-0000-000000000c01")
+    cache = _OverlayCache()
+
+    # Register the SAME callback shape the driver uses (decoded dict).
+    def _on_decoded(decoded: object) -> None:
+        parsed = _validate_overlay_payload(decoded)
+        if parsed is not None:
+            cache.update(parsed)
+
+    bus.subscribe(FRAME_OVERLAY_CHANNEL, _on_decoded)
+
+    # Publish exactly what the codegen emits.
+    bus.publish(
+        FRAME_OVERLAY_CHANNEL,
+        {
+            "v": 1,
+            "boxes": [{"box_2d": [1, 2, 3, 4], "label": "person", "conf": 0.9}],
+            "style": {"line_width": 2, "font_scale": 0.5, "show_confidence": True},
+        },
+    )
+
+    snap = cache.snapshot()
+    assert snap is not None, "callback never updated cache — broken wire contract"
+    assert snap["boxes"][0]["label"] == "person"
