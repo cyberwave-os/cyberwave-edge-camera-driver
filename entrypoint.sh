@@ -34,4 +34,7 @@ export_vars(data)
 ")"
 fi
 
-exec python main.py "$@"
+# Use python3 explicitly: the Dockerfile installs python3 from apt and does
+# not create a python -> python3 symlink (no python-is-python3), so calling
+# `python` exits 127 on the Pi and crashloops under edge-core's watchdog.
+exec python3 main.py "$@"
