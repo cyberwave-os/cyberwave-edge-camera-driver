@@ -49,8 +49,12 @@ RUN rm -f /usr/lib/python*/EXTERNALLY-MANAGED
 # V4L2 backend. This is cheap insurance against a future debian/ubuntu
 # packaging change quietly stripping V4L2, which is exactly the regression
 # that this image was rebuilt to fix.
+#
+# Debian's python3-opencv 4.6.0 emits lowercase ``v4l/v4l2: YES``, while
+# the manylinux PyPI wheels (and OpenCV's upstream Linux builds) emit
+# uppercase ``V4L/V4L2: YES``. Match both with re.IGNORECASE.
 RUN python3 -c "import cv2, re; info = cv2.getBuildInformation(); \
-    assert re.search(r'V4L/V4L2:\s+YES', info), \
+    assert re.search(r'V4L/V4L2:\s+YES', info, re.IGNORECASE), \
         'apt python3-opencv has no V4L2 backend:\n' + info; \
     print('OpenCV V4L2 backend confirmed at', cv2.__file__)"
 
@@ -96,9 +100,10 @@ RUN pip uninstall -y opencv-python opencv-python-headless 2>/dev/null || true
 
 # Final post-install assertion: cv2 still imports and still carries V4L2.
 # Without this, a future SDK change that re-pulls opencv-python (e.g. via a
-# transitive dep) would silently downgrade the runtime backend.
+# transitive dep) would silently downgrade the runtime backend. Same
+# lowercase/uppercase nuance as the base-stage assertion.
 RUN python3 -c "import cv2, re; info = cv2.getBuildInformation(); \
-    assert re.search(r'V4L/V4L2:\s+YES', info), \
+    assert re.search(r'V4L/V4L2:\s+YES', info, re.IGNORECASE), \
         'Runtime cv2 lost V4L2 backend after install:\n' + info; \
     print('Runtime cv2 ready at', cv2.__file__)"
 
