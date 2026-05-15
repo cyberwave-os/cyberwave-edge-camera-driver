@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cyberwave-edge-camera-driver"
-version = "0.3.1"
+version = "0.3.2"
 description = "Cyberwave Edge Camera Driver for streaming camera feeds"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -30,9 +30,15 @@ classifiers = [
 ]
 
 dependencies = [
+    # Pin the SDK to an exact version so rebuilds are deterministic. Without
+    # this pin the Docker image content drifted across rebuilds because
+    # ``pip install`` would resolve to whichever SDK / opencv-python wheel was
+    # current at build time (see CYB-1998). The Dockerfile separately removes
+    # the opencv-python wheel that the [camera] extra pulls in, because the
+    # container relies on apt's V4L2-enabled python3-opencv instead.
     # [zenoh] is required for the same-host frame bus; publishing silently
     # degraded to WebRTC-only before 0.4.3 when eclipse-zenoh was missing.
-    "cyberwave[camera,zenoh]>=0.4.2",
+    "cyberwave[camera,zenoh]==0.4.8",
     "python-dotenv>=1.0.0",
 ]
 

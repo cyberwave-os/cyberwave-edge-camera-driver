@@ -19,6 +19,17 @@ A Cyberwave edge driver that streams a USB or depth camera feed to a digital twi
 
 Launched automatically by `cyberwave-edge-core` when a twin's metadata references this driver image.
 
+## Platform support
+
+This container image is **Linux-only**. It is built on Debian bookworm with `python3-opencv` from apt so that OpenCV is linked against `libv4l` and can negotiate `MJPG` on `/dev/video*` reliably (see the [CYB-1998 note](#why-debian-python3-opencv-instead-of-the-pip-wheel) below for the full story).
+
+| Scenario | Recommended path |
+| --- | --- |
+| Linux edge device (Raspberry Pi, x86 server) | This container image (`cyberwaveos/camera-driver`) |
+| macOS native development | `pip install cyberwave[camera]` — the macOS `opencv-python` wheel ships with AVFoundation |
+| Windows native development | `pip install cyberwave[camera]` — the Windows wheel ships with MSMF + DSHOW |
+| Docker Desktop on macOS | **Not supported.** Docker Desktop's LinuxKit VM does not expose host USB devices to containers, so `/dev/video0` does not exist inside the container regardless of how OpenCV is built. Run the SDK natively instead. |
+
 ## Driver metadata
 
 Set the following fields in the twin or asset metadata to configure the driver:
@@ -73,6 +84,8 @@ Injected by `cyberwave-edge-core` at runtime:
 | `CYBERWAVE_DETECTION_OVERLAYS`    | `true` (default) to draw YOLO bounding boxes from the `detections/*` Zenoh channel on the WebRTC stream. Set to `false` to disable. Ignored on depth cameras. |
 | `CYBERWAVE_METADATA_FRAME_FILTER_ENABLED` | `false` (default). Set to `true` to subscribe to the `frames/filtered` Zenoh channel and substitute worker-processed (e.g. anonymised/pixelated) frames into the WebRTC stream before encoding. When enabled, emits a black frame if no fresh processed frame is available — privacy-safe by default, no raw fallback. |
 | `CYBERWAVE_METADATA_FRAME_FILTER_FRESHNESS_MS` | Max age (ms) of a processed frame before it is treated as stale and replaced with a blank frame. Default: `200` (tuned for ≥ 5 Hz GPU workers). Raise to `400`–`500` for CPU-only workers; higher values keep more visibly-stale frames on screen and weaken the privacy contract. `0` is a valid "force blank" fail-close test mode. Only honoured when `CYBERWAVE_METADATA_FRAME_FILTER_ENABLED=true`. |
+| `CYBERWAVE_CAMERA_STRICT_GEOMETRY` | `false` (default). Set to `true` on edge images where you want a resolution mismatch (e.g. requested VGA but driver got 1080p because the camera fell back to its native format) to raise `RuntimeError` at startup rather than logging a `WARNING` and shipping a stream that is 50x over the bandwidth budget. |
+| `CYBERWAVE_CAMERA_SKIP_V4L2_CHECK` | `false` (default). Escape hatch for the Linux V4L2 build-info self-test in the SDK. Set to `true` to bypass the check; only useful if you are intentionally running on a Linux host with an OpenCV that lacks V4L2 and you understand the consequences (frames default to YUYV at the camera's native resolution). |
 
 ## Zenoh data bus
 
@@ -167,6 +180,14 @@ When required camera hardware is unavailable (for example, missing/disconnected 
 - If a configured `/dev/video*` path is missing, the driver first attempts auto-discovery fallback before exiting with a hardware error.
 - Exit code `66`: hardware connection failure
 - Exit code `1`: other unhandled runtime failures (including Zenoh init failure when `CYBERWAVE_PUBLISH_MODE=zenoh_only`)
+
+## Why Debian `python3-opencv` instead of the pip wheel?
+
+The image installs OpenCV via Debian's `python3-opencv` package (built with `V4L/V4L2: YES`) rather than the `opencv-python` PyPI wheel. The manylinux `opencv-python` wheel is built without the native V4L2 backend, which routes `cv2.VideoCapture("/dev/video0")` through FFmpeg's libavformat V4L2 demuxer. In that demuxer, `cap.set(CAP_PROP_FOURCC, MJPG)` is a no-op (FFmpeg wants `-input_format mjpeg` at open time) and `cap.get(CAP_PROP_FOURCC)` returns `0`. The SDK's negotiator then concludes that MJPG did not stick, reopens the device without a FOURCC override, and the camera lands on its kernel default — typically YUYV `1920x1080 @ 5 fps` on USB 2.0. The resulting `~58 MB/s` raw firehose blows the Zenoh publish budget and causes downstream worker drops.
+
+The Dockerfile asserts `V4L/V4L2: YES` in `cv2.getBuildInformation()` at build time so that a future packaging accident fails the image build instead of the running camera. The SDK does the same check at startup so a developer running `pip install cyberwave[camera]` on a Linux host with a stripped OpenCV wheel gets a clear `RuntimeError` instead of a 5 fps stream.
+
+If you genuinely need to bypass the check (e.g. running a test container with a custom OpenCV build), set `CYBERWAVE_CAMERA_SKIP_V4L2_CHECK=1`. macOS and Windows users are unaffected — the check only fires on `platform.system() == "Linux"`.
 
 ## Contributing
 
