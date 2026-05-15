@@ -39,6 +39,15 @@ dependencies = [
     # [zenoh] is required for the same-host frame bus; publishing silently
     # degraded to WebRTC-only before 0.4.3 when eclipse-zenoh was missing.
     "cyberwave[camera,zenoh]==0.4.8",
+    # NumPy 1.x for binary compatibility with Debian's ``python3-opencv``
+    # 4.6.0, which is the cv2 binding we install via apt (see Dockerfile).
+    # Without this cap, pip resolves the SDK's ``numpy>=1.26`` to the latest
+    # NumPy 2.x; pip's 2.x install at /usr/local/... wins over apt's 1.24
+    # at /usr/lib/python3/dist-packages/, and ``import cv2`` then dies with
+    # ``ImportError: numpy.core.multiarray failed to import`` because apt's
+    # cv2 was compiled against the NumPy 1.x C ABI. This bound resolves to
+    # ``numpy>=1.26,<2`` from PyPI, which is ABI-compatible with the apt cv2.
+    "numpy>=1.26,<2",
     "python-dotenv>=1.0.0",
 ]
 
