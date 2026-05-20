@@ -20,6 +20,19 @@
 # -----------------------------------------------------------------------------
 FROM debian:bookworm-slim AS base
 
+ARG VERSION=dev
+ARG BUILD_DATE
+ARG VCS_REF
+
+LABEL org.opencontainers.image.title="Cyberwave Edge Camera Driver" \
+      org.opencontainers.image.description="Cyberwave edge camera driver with apt OpenCV V4L2 backend" \
+      org.opencontainers.image.url="https://github.com/cyberwave-os/cyberwave-edge-camera-driver" \
+      org.opencontainers.image.source="https://github.com/cyberwave-os/cyberwave-edge-camera-driver" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 WORKDIR /app
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -87,10 +100,11 @@ COPY LICENSE .
 # docker build). An empty sdk-local/ directory is used in production builds so
 # this step is a no-op.
 COPY sdk-local /tmp/sdk-local
-RUN if [ -f "/tmp/sdk-local/pyproject.toml" ]; then \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -f "/tmp/sdk-local/pyproject.toml" ]; then \
         pip install "/tmp/sdk-local[camera,zenoh]"; \
-    fi
-RUN pip install .
+    fi && \
+    pip install .
 
 # The [camera] extra pulls in opencv-python from PyPI. We want the apt-built
 # python3-opencv (with V4L2) to be the cv2 that gets imported, so uninstall
@@ -107,9 +121,13 @@ RUN python3 -c "import cv2, re; info = cv2.getBuildInformation(); \
         'Runtime cv2 lost V4L2 backend after install:\n' + info; \
     print('Runtime cv2 ready at', cv2.__file__)"
 
+RUN python3 -c "import main; print('Camera driver application import OK')"
+
 RUN mkdir -p /app/.cyberwave
 
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
+# Twin JSON → CYBERWAVE_* env, then start main.py (edge-core may override CMD).
 ENTRYPOINT ["./entrypoint.sh"]
+CMD []

@@ -189,6 +189,25 @@ The Dockerfile asserts `V4L/V4L2: YES` in `cv2.getBuildInformation()` at build t
 
 If you genuinely need to bypass the check (e.g. running a test container with a custom OpenCV build), set `CYBERWAVE_CAMERA_SKIP_V4L2_CHECK=1`. macOS and Windows users are unaffected — the check only fires on `platform.system() == "Linux"`.
 
+## Local image build and smoke test
+
+From the monorepo root, bundle the in-tree SDK and build the same image CI publishes:
+
+```bash
+./cyberwave-edge-nodes/cyberwave-edge-camera-driver/build-dev-image.sh
+# RealSense variant:
+ENABLE_REALSENSE=true IMAGE=cyberwaveos/camera-driver:dev-realsense \
+  ./cyberwave-edge-nodes/cyberwave-edge-camera-driver/build-dev-image.sh
+```
+
+Run the Docker E2E smoke test (build, V4L2 assertion, `pytest tests` inside the container):
+
+```bash
+./cyberwave-edge-nodes/cyberwave-edge-camera-driver/test_docker_e2e.sh
+```
+
+CI runs the same flow via `.github/workflows/edge-node-camera-driver-test-and-push.yml` (unit tests on the host, E2E in `test_build_dockerfile`, multi-arch push to `cyberwaveos/camera-driver` with standard and `-realsense` tags).
+
 ## Contributing
 
 Contributions are welcome. Please open an issue for bugs or feature requests, and submit a pull request for improvements.
