@@ -45,6 +45,6 @@ echo "[INFO] Running camera driver unit tests inside container"
 docker run --rm --entrypoint bash \
   -v "$SCRIPT_DIR/tests:/app/tests:ro" \
   "$IMAGE_NAME" \
-  -lc "pip install --quiet pytest pytest-asyncio && cd /app && pytest tests -q"
+  -lc "pip install --quiet pytest && cd /app && pytest tests -q -o addopts="
 
 echo "[PASS] Camera driver Docker E2E smoke test passed."
