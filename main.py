@@ -434,6 +434,88 @@ def _parse_overlay_payload(payload: bytes) -> dict | None:
     return _validate_overlay_payload(data)
 
 
+# Defensive cap on incoming polygon vertices per detection. The SDK
+# helper caps at ~64 via approxPolyDP, so anything over this is either
+# a misbehaving worker or a future schema change we don't know about.
+# Worst-case 64 KB of int32 points per detection — bounded enough to
+# composite at frame rate without DoSing the encoder.
+_POLY_MAX_POINTS: int = 1024
+
+
+_OVERLAY_PALETTE: tuple[tuple[int, int, int], ...] = (
+    (0, 200, 0),
+    (0, 165, 255),
+    (255, 0, 0),
+    (0, 0, 255),
+    (255, 255, 0),
+    (255, 0, 255),
+    (0, 255, 255),
+    (128, 0, 128),
+)
+
+
+def _overlay_color_for(label: str) -> tuple[int, int, int]:
+    idx = sum(ord(c) for c in label) % len(_OVERLAY_PALETTE)
+    return _OVERLAY_PALETTE[idx]
+
+
+def _draw_overlay_masks(
+    frame: np.ndarray,
+    boxes: list,
+    *,
+    mask_alpha: float,
+    mask_outline: bool,
+    line_width: int,
+) -> None:
+    """Composite per-detection polygons onto ``frame`` in place.
+
+    Polygons live in original-frame coordinates. Pixels outside any
+    polygon are untouched. Boxes without a ``polygon`` field skip the
+    mask path so detection-only models cost nothing here.
+    """
+    import cv2
+
+    h, w = frame.shape[:2]
+    fill_overlay: np.ndarray | None = None
+    mask_acc_u8: np.ndarray | None = None
+    outlines: list[tuple[np.ndarray, tuple[int, int, int]]] = []
+    for box in boxes:
+        poly = box.get("polygon")
+        if not isinstance(poly, list) or not (3 <= len(poly) <= _POLY_MAX_POINTS):
+            continue
+        try:
+            pts = np.array(
+                [[int(p[0]), int(p[1])] for p in poly if len(p) >= 2],
+                dtype=np.int32,
+            )
+        except (TypeError, ValueError):
+            continue
+        if pts.shape[0] < 3:
+            continue
+        np.clip(pts[:, 0], 0, w - 1, out=pts[:, 0])
+        np.clip(pts[:, 1], 0, h - 1, out=pts[:, 1])
+        color = _overlay_color_for(str(box.get("label", "")))
+        if mask_alpha > 0:
+            if fill_overlay is None:
+                fill_overlay = frame.copy()
+                mask_acc_u8 = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(fill_overlay, [pts], color)
+            cv2.fillPoly(mask_acc_u8, [pts], 1)
+        if mask_outline:
+            outlines.append((pts, color))
+    if fill_overlay is not None and mask_acc_u8 is not None and mask_alpha > 0:
+        mask_acc = mask_acc_u8.astype(bool)
+        if mask_acc.any():
+            blended = (
+                mask_alpha * fill_overlay.astype(np.float32)
+                + (1.0 - mask_alpha) * frame.astype(np.float32)
+            ).astype(np.uint8)
+            frame[mask_acc] = blended[mask_acc]
+    if mask_outline and line_width > 0:
+        for pts, color in outlines:
+            cv2.polylines(frame, [pts], True, color, max(1, line_width))
+
+
 def _draw_overlay(frame: np.ndarray, payload: dict) -> None:
     """Draw the overlay payload's boxes + captions on ``frame`` in place.
 
@@ -454,8 +536,20 @@ def _draw_overlay(frame: np.ndarray, payload: dict) -> None:
     line_width = max(0, int(style.get("line_width", 2) or 0))
     font_scale = float(style.get("font_scale", 0.5) or 0.0)
     show_confidence = bool(style.get("show_confidence", True))
+    mask_alpha = max(0.0, min(1.0, float(style.get("mask_alpha", 0.0) or 0.0)))
+    mask_outline = bool(style.get("mask_outline", True))
 
     h, w = frame.shape[:2]
+
+    if mask_alpha > 0 or mask_outline:
+        _draw_overlay_masks(
+            frame,
+            boxes,
+            mask_alpha=mask_alpha,
+            mask_outline=mask_outline,
+            line_width=line_width,
+        )
+
     for box in boxes:
         coords = box.get("box_2d")
         if not isinstance(coords, list | tuple) or len(coords) != 4:

@@ -306,6 +306,59 @@ def test_draw_overlay_respects_payload_line_width() -> None:
     assert thickness == 7
 
 
+def test_draw_overlay_renders_polygon_fill_inside_polygon() -> None:
+    pytest.importorskip("cv2")
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    payload = {
+        "v": 1,
+        "boxes": [
+            {
+                "box_2d": [20.0, 20.0, 60.0, 60.0],
+                "label": "person",
+                "conf": 0.9,
+                "polygon": [[20, 20], [60, 20], [60, 60], [20, 60]],
+            }
+        ],
+        "style": {
+            "line_width": 0,
+            "font_scale": 0.0,
+            "show_confidence": False,
+            "mask_alpha": 0.5,
+            "mask_outline": False,
+        },
+    }
+    _draw_overlay(frame, payload)
+    assert frame[40, 40].any(), "Pixel inside polygon should be coloured by mask fill"
+    assert not frame[5, 5].any(), "Pixel outside polygon should stay zero"
+
+
+def test_draw_overlay_polygon_no_fill_when_alpha_zero_but_outline_draws() -> None:
+    pytest.importorskip("cv2")
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    payload = {
+        "v": 1,
+        "boxes": [
+            {
+                "box_2d": [20.0, 20.0, 60.0, 60.0],
+                "label": "person",
+                "conf": 0.9,
+                "polygon": [[20, 20], [60, 20], [60, 60], [20, 60]],
+            }
+        ],
+        "style": {
+            "line_width": 1,
+            "font_scale": 0.0,
+            "show_confidence": False,
+            "mask_alpha": 0.0,
+            "mask_outline": True,
+        },
+    }
+    _draw_overlay(frame, payload)
+    # Interior should be zero (no fill), edge should have a pixel from polylines.
+    assert not frame[40, 40].any()
+    assert frame[20, 30:50].any()
+
+
 def test_draw_overlay_skips_zero_area_and_unknown_box_shape() -> None:
     pytest.importorskip("cv2")
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
