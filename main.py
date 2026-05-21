@@ -56,6 +56,7 @@ Camera-specific metadata params (set on the twin / asset metadata):
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -442,21 +443,40 @@ def _parse_overlay_payload(payload: bytes) -> dict | None:
 _POLY_MAX_POINTS: int = 1024
 
 
+# Mirrors ``cyberwave.vision.annotate._DEFAULT_PALETTE`` so a class
+# rendered by the SDK's numpy annotator gets the *same* colour as when
+# the driver composites the polygon overlay (callers that run both
+# paths shouldn't see a class flicker between hops). Keep this list
+# byte-for-byte aligned with the SDK; if the SDK adds a colour, mirror
+# it here in the same slot.
 _OVERLAY_PALETTE: tuple[tuple[int, int, int], ...] = (
-    (0, 200, 0),
-    (0, 165, 255),
-    (255, 0, 0),
-    (0, 0, 255),
-    (255, 255, 0),
-    (255, 0, 255),
-    (0, 255, 255),
-    (128, 0, 128),
+    (0, 200, 0),  # green
+    (0, 165, 255),  # orange
+    (255, 0, 0),  # blue
+    (0, 0, 255),  # red
+    (255, 255, 0),  # cyan
+    (255, 0, 255),  # magenta
+    (0, 255, 255),  # yellow
+    (128, 0, 128),  # purple
+    (255, 128, 0),  # azure
+    (128, 128, 0),  # teal
+    (0, 128, 255),  # amber
+    (203, 192, 255),  # pink
 )
 
 
 def _overlay_color_for(label: str) -> tuple[int, int, int]:
-    idx = sum(ord(c) for c in label) % len(_OVERLAY_PALETTE)
-    return _OVERLAY_PALETTE[idx]
+    """Stable per-label colour, byte-identical to the SDK helper.
+
+    Matches :func:`cyberwave.vision.annotate._default_color_for`: MD5
+    of the UTF-8 label, first byte modulo palette size. Anything more
+    elaborate would drift the two surfaces — they need to agree so the
+    same class keeps its colour across SDK direct-annotate and
+    driver-side polygon overlays. ``md5`` is used purely as a stable
+    hash; nothing here is cryptographic.
+    """
+    digest = hashlib.md5(label.encode("utf-8")).digest()
+    return _OVERLAY_PALETTE[digest[0] % len(_OVERLAY_PALETTE)]
 
 
 def _draw_overlay_masks(

@@ -359,6 +359,37 @@ def test_draw_overlay_polygon_no_fill_when_alpha_zero_but_outline_draws() -> Non
     assert frame[20, 30:50].any()
 
 
+def test_overlay_color_matches_sdk_helper() -> None:
+    """``_overlay_color_for`` must hash labels exactly like the SDK's
+    ``_default_color_for`` so a class drawn by ``annotate_detections``
+    (numpy path) and the driver-side polygon overlay agree byte-for-byte.
+
+    This is a parity contract, not just a smoke test: if the SDK adds a
+    palette colour or changes the hash, this test fires before the two
+    surfaces drift in production. The driver palette is intentionally
+    duplicated (the driver can't take a runtime dep on cv2-side
+    annotate paths), so we lock alignment with an explicit assertion.
+    """
+    pytest.importorskip("cyberwave.vision.annotate")
+
+    from cyberwave.vision.annotate import (
+        _DEFAULT_PALETTE,
+        _default_color_for,
+    )
+
+    from main import _OVERLAY_PALETTE, _overlay_color_for
+
+    assert _OVERLAY_PALETTE == _DEFAULT_PALETTE, (
+        "Driver palette drifted from SDK palette; mirror the SDK list "
+        "byte-for-byte (see comment at _OVERLAY_PALETTE in main.py)."
+    )
+    # A handful of labels covering ASCII, multi-word, and non-ASCII so
+    # any shift in the encode (e.g. someone swapping md5(label) for
+    # md5(label.lower())) gets caught.
+    for label in ("person", "car", "Bicycle", "traffic light", "café"):
+        assert _overlay_color_for(label) == _default_color_for(label), label
+
+
 def test_draw_overlay_skips_zero_area_and_unknown_box_shape() -> None:
     pytest.importorskip("cv2")
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
