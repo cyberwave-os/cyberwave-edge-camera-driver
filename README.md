@@ -15,7 +15,7 @@ This module is part of **Cyberwave: Making the physical world programmable**.
 [![PyPI Python versions](https://img.shields.io/pypi/pyversions/cyberwave-edge-camera-driver.svg)](https://pypi.org/project/cyberwave-edge-camera-driver/)
 [![Docker Build](https://github.com/cyberwave-os/cyberwave-edge-camera-driver/actions/workflows/push-to-docker-hub.yml/badge.svg)](https://github.com/cyberwave-os/cyberwave-edge-camera-driver/actions/workflows/push-to-docker-hub.yml)
 
-A Cyberwave edge driver that streams a USB or depth camera feed to a digital twin.
+A Cyberwave edge driver that streams a USB, IP/RTSP, or depth camera feed to a digital twin.
 
 Launched automatically by `cyberwave-edge-core` when a twin's metadata references this driver image.
 
@@ -48,7 +48,67 @@ Set the following fields in the twin or asset metadata to configure the driver:
 | Field             | Type    | Default | Description                                                       |
 | ----------------- | ------- | ------- | ----------------------------------------------------------------- |
 | `is_depth_camera` | boolean | `false` | Set to `true` for RGBD/depth cameras (e.g. Intel RealSense D455). |
-| `video_device`    | string  | `"0"`   | `/dev/video*` index or path (e.g. `"0"`, `"/dev/video2"`).        |
+| `video_device`    | string  | `"0"`   | Capture source — see [Video source formats](#video-source-cyberwave_metadata_video_device) below. |
+
+## Video source (`CYBERWAVE_METADATA_VIDEO_DEVICE`)
+
+The driver opens whatever string is in `CYBERWAVE_METADATA_VIDEO_DEVICE` (from twin
+`metadata.video_device`, expanded by `entrypoint.sh`, or injected by edge-core).
+This is the **only** field that selects which camera to stream.
+
+| Format | Example | Notes |
+| --- | --- | --- |
+| Device index | `"0"` | Local USB/V4L2 camera (OpenCV index). Default when unset. |
+| Device path | `"/dev/video2"` | Linux V4L2 device node. |
+| RTSP URL | `rtsp://user:pass@192.168.1.50:554/stream1` | IP cameras (Tapo, NVR channels, …). Uses OpenCV/FFmpeg with **TCP** transport. Credentials in the URL are optional; they are masked in edge-health telemetry. |
+| HTTP(S) URL | `http://192.168.1.50/snapshot.jpg` | Snapshot or MJPEG-over-HTTP sources. |
+| RealSense serial | `"123456789012"` | With `is_depth_camera: true` / `CYBERWAVE_METADATA_IS_DEPTH_CAMERA=true`. |
+
+RTSP and HTTP sources do **not** use `/dev/video*`. If the container env shows
+`/dev/video0` for an IP-camera twin, edge-core has applied the wrong source — see
+below.
+
+### IP / RTSP camera example
+
+Pin the RTSP URL in twin metadata so edge-core does not substitute a local USB
+device from `~/.cyberwave/cameras.json`:
+
+```json
+"drivers": {
+    "default": {
+        "docker_image": "cyberwaveos/camera-driver",
+        "params": [
+            "-e",
+            "CYBERWAVE_METADATA_VIDEO_DEVICE=rtsp://user:pass@192.168.1.50:554/stream1"
+        ]
+    }
+}
+```
+
+Verify after edge-core starts the driver:
+
+```bash
+docker inspect cyberwave-driver-<twin_uuid_prefix> \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' | grep VIDEO_DEVICE
+```
+
+The value must be your `rtsp://…` URL, not `/dev/video0`.
+
+Optional: also store the URL under `metadata.edge_configs.camera_config.source`
+for dashboard visibility — the driver reads `CYBERWAVE_METADATA_VIDEO_DEVICE`, not
+`edge_configs`, at stream-open time today.
+
+### How edge-core sets this variable
+
+On **Linux**, when `CYBERWAVE_METADATA_VIDEO_DEVICE` is not already set via
+`drivers.default.params`, edge-core may inject a device from
+`~/.cyberwave/cameras.json` (`selected_device` or `twin_to_device`). That mapping
+only covers local `/dev/video*` devices. **IP-camera twins on the same host as USB
+webcams need an explicit RTSP URL** in driver `params` (or another explicit env)
+to avoid picking up the wrong `/dev/video*`.
+
+On **macOS**, edge-core may inject an MJPEG bridge URL from
+`~/.cyberwave/camera_streams.json` instead of `/dev/video*`.
 
 ## Building with RealSense support
 
@@ -79,6 +139,7 @@ Injected by `cyberwave-edge-core` at runtime:
 | `CYBERWAVE_API_KEY`               | API token                                                                                      |
 | `CYBERWAVE_TWIN_UUID`             | UUID of the camera twin to stream to                                                           |
 | `CYBERWAVE_TWIN_JSON_FILE`        | Path to the twin JSON file (auto-expanded into `CYBERWAVE_METADATA_*` vars by `entrypoint.sh`) |
+| `CYBERWAVE_METADATA_VIDEO_DEVICE` | Capture source — device index, `/dev/video*`, RTSP/HTTP URL, or RealSense serial. See [Video source formats](#video-source-cyberwave_metadata_video_device). |
 | `CYBERWAVE_FRAME_ENCODING`        | `raw` (default) for numpy arrays via SHM, or `jpeg` for JPEG-encoded frames (lower bandwidth)  |
 | `CYBERWAVE_FRAME_JPEG_QUALITY`    | JPEG quality 1-100 when encoding is `jpeg` (default: `90`)                                     |
 | `CYBERWAVE_DETECTION_OVERLAYS`    | `true` (default) to draw YOLO bounding boxes from the `detections/*` Zenoh channel on the WebRTC stream. Set to `false` to disable. Ignored on depth cameras. |
@@ -172,6 +233,26 @@ publishing on this channel — check the worker container logs.
 The previous design fired one warning the moment any frame went stale and then suppressed further warnings for the rest of the window — that fired loudly even when 99% of frames were fine, which happens routinely when the worker publishes at 5 fps and the driver polls at 30 fps with the default 200 ms freshness window. The summary form lets operators distinguish "occasional jitter" (~1%) from "worker is down" (~100%).
 
 > **Note:** `frame_filter.py` in this package is a temporary port of the same module in `cyberwave-edge-runtime/runtime-services/drivers/native/cyberwave/generic-camera`. Once that driver image is published and the backend asset registry repoints to it, the copy here should be removed.
+
+## Troubleshooting
+
+**Wrong camera / IP twin shows USB feed**
+
+If `docker inspect cyberwave-driver-<prefix> --format '…' | grep VIDEO_DEVICE` shows
+`/dev/video0` but you configured an RTSP camera, edge-core applied
+`~/.cyberwave/cameras.json` instead of your RTSP URL. Pin the URL in
+`drivers.default.params` as shown in [Video source formats](#video-source-cyberwave_metadata_video_device).
+
+**RTSP stream does not open**
+
+Test from the edge host (or inside the driver container network namespace):
+
+```bash
+ffprobe -v error "rtsp://user:pass@192.168.1.50:554/stream1"
+```
+
+Confirm the camera account, path (`/stream1` vs `/stream2` on Tapo), and that the
+edge host can reach the camera IP on the LAN.
 
 ## Failure signaling
 
