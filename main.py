@@ -442,16 +442,15 @@ def _parse_overlay_payload(payload: bytes) -> dict | None:
 _POLY_MAX_POINTS: int = 1024
 
 
-# Mirrors ``cyberwave.vision.annotate._DEFAULT_PALETTE`` so a class
-# rendered by the SDK's numpy annotator gets the *same* colour as when
 def _overlay_color_from_box(box: dict) -> tuple[int, int, int]:
     """Return the pre-resolved BGR color from a box entry, or fall back to auto.
 
     ``build_overlay_payload`` in the SDK resolves the palette and includes
     ``color: [r, g, b]`` on each box so the driver never needs its own palette
-    copy. For payloads from older SDK versions that lack the field, we delegate
-    to ``cyberwave.vision.annotate.label_color`` so the SDK stays the single
-    source of truth for palette data.
+    copy. For payloads from older SDK versions that lack the field we delegate
+    to ``cyberwave.vision.annotate.label_color``; if the installed SDK predates
+    that helper we degrade to a constant green so the frame callback never
+    raises ``ImportError`` on every frame.
     """
     raw = box.get("color")
     if isinstance(raw, (list, tuple)) and len(raw) == 3:
@@ -459,8 +458,10 @@ def _overlay_color_from_box(box: dict) -> tuple[int, int, int]:
             return (int(raw[0]), int(raw[1]), int(raw[2]))
         except (TypeError, ValueError):
             pass
-    from cyberwave.vision.annotate import label_color
-
+    try:
+        from cyberwave.vision.annotate import label_color
+    except ImportError:
+        return (0, 200, 0)
     return label_color(str(box.get("label", "")))
 
 

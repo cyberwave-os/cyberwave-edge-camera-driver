@@ -377,6 +377,31 @@ def test_overlay_color_fallback_matches_sdk_label_color() -> None:
         assert _overlay_color_from_box(box_without_color) == label_color(label), label
 
 
+def test_overlay_color_falls_back_to_default_when_label_color_missing() -> None:
+    """Driver must degrade to green (not raise) when the installed SDK
+    predates ``cyberwave.vision.annotate.label_color`` (CYB-2218 rollout)."""
+    import builtins
+
+    from main import _overlay_color_from_box
+
+    real_import = builtins.__import__
+
+    def _import_without_label_color(name, globals=None, locals=None, fromlist=(), level=0):  # type: ignore[no-untyped-def]
+        if name == "cyberwave.vision.annotate" and "label_color" in (fromlist or ()):
+            raise ImportError(
+                "cannot import name 'label_color' from 'cyberwave.vision.annotate'"
+            )
+        return real_import(name, globals, locals, fromlist, level)
+
+    with patch.object(builtins, "__import__", _import_without_label_color):
+        assert _overlay_color_from_box({"label": "person", "conf": 0.9}) == (0, 200, 0)
+        assert _overlay_color_from_box({"label": "car", "conf": 0.5}) == (0, 200, 0)
+        # A pre-resolved ``color`` short-circuits before the import.
+        assert _overlay_color_from_box(
+            {"label": "person", "color": [10, 20, 30]}
+        ) == (10, 20, 30)
+
+
 def test_draw_overlay_skips_zero_area_and_unknown_box_shape() -> None:
     pytest.importorskip("cv2")
     frame = np.zeros((100, 100, 3), dtype=np.uint8)

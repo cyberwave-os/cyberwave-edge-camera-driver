@@ -30,15 +30,15 @@ classifiers = [
 ]
 
 dependencies = [
-    # Pin the SDK to an exact version so rebuilds are deterministic. Without
-    # this pin the Docker image content drifted across rebuilds because
-    # ``pip install`` would resolve to whichever SDK / opencv-python wheel was
-    # current at build time (see CYB-1998). The Dockerfile separately removes
-    # the opencv-python wheel that the [camera] extra pulls in, because the
-    # container relies on apt's V4L2-enabled python3-opencv instead.
-    # [zenoh] is required for the same-host frame bus; publishing silently
-    # degraded to WebRTC-only before 0.4.3 when eclipse-zenoh was missing.
-    "cyberwave[camera,zenoh]==0.4.8",
+    # Floor at the CYB-2218 SDK so ``label_color`` is importable and
+    # ``build_overlay_payload`` pre-resolves per-box ``color``. ``>=`` lets
+    # ``build-dev-image.sh`` keep the in-tree SDK it bundles into
+    # ``sdk-local/`` instead of being downgraded by the second
+    # ``pip install .`` step in the Dockerfile. The Dockerfile then removes
+    # the opencv-python wheel pulled by [camera] because the container uses
+    # apt's V4L2-enabled python3-opencv. [zenoh] is required for the same-host
+    # frame bus (CYB-1998).
+    "cyberwave[camera,zenoh]>=0.5.0",
     # NumPy 1.x for binary compatibility with Debian's ``python3-opencv``
     # 4.6.0, which is the cv2 binding we install via apt (see Dockerfile).
     # Without this cap, pip resolves the SDK's ``numpy>=1.26`` to the latest
