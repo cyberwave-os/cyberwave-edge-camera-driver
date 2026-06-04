@@ -56,7 +56,6 @@ Camera-specific metadata params (set on the twin / asset metadata):
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -445,38 +444,24 @@ _POLY_MAX_POINTS: int = 1024
 
 # Mirrors ``cyberwave.vision.annotate._DEFAULT_PALETTE`` so a class
 # rendered by the SDK's numpy annotator gets the *same* colour as when
-# the driver composites the polygon overlay (callers that run both
-# paths shouldn't see a class flicker between hops). Keep this list
-# byte-for-byte aligned with the SDK; if the SDK adds a colour, mirror
-# it here in the same slot.
-_OVERLAY_PALETTE: tuple[tuple[int, int, int], ...] = (
-    (0, 200, 0),  # green
-    (0, 165, 255),  # orange
-    (255, 0, 0),  # blue
-    (0, 0, 255),  # red
-    (255, 255, 0),  # cyan
-    (255, 0, 255),  # magenta
-    (0, 255, 255),  # yellow
-    (128, 0, 128),  # purple
-    (255, 128, 0),  # azure
-    (128, 128, 0),  # teal
-    (0, 128, 255),  # amber
-    (203, 192, 255),  # pink
-)
+def _overlay_color_from_box(box: dict) -> tuple[int, int, int]:
+    """Return the pre-resolved BGR color from a box entry, or fall back to auto.
 
-
-def _overlay_color_for(label: str) -> tuple[int, int, int]:
-    """Stable per-label colour, byte-identical to the SDK helper.
-
-    Matches :func:`cyberwave.vision.annotate._default_color_for`: MD5
-    of the UTF-8 label, first byte modulo palette size. Anything more
-    elaborate would drift the two surfaces — they need to agree so the
-    same class keeps its colour across SDK direct-annotate and
-    driver-side polygon overlays. ``md5`` is used purely as a stable
-    hash; nothing here is cryptographic.
+    ``build_overlay_payload`` in the SDK resolves the palette and includes
+    ``color: [r, g, b]`` on each box so the driver never needs its own palette
+    copy. For payloads from older SDK versions that lack the field, we delegate
+    to ``cyberwave.vision.annotate.label_color`` so the SDK stays the single
+    source of truth for palette data.
     """
-    digest = hashlib.md5(label.encode("utf-8")).digest()
-    return _OVERLAY_PALETTE[digest[0] % len(_OVERLAY_PALETTE)]
+    raw = box.get("color")
+    if isinstance(raw, (list, tuple)) and len(raw) == 3:
+        try:
+            return (int(raw[0]), int(raw[1]), int(raw[2]))
+        except (TypeError, ValueError):
+            pass
+    from cyberwave.vision.annotate import label_color
+
+    return label_color(str(box.get("label", "")))
 
 
 def _draw_overlay_masks(
@@ -514,7 +499,7 @@ def _draw_overlay_masks(
             continue
         np.clip(pts[:, 0], 0, w - 1, out=pts[:, 0])
         np.clip(pts[:, 1], 0, h - 1, out=pts[:, 1])
-        color = _overlay_color_for(str(box.get("label", "")))
+        color = _overlay_color_from_box(box)
         if mask_alpha > 0:
             if fill_overlay is None:
                 fill_overlay = frame.copy()
@@ -539,13 +524,11 @@ def _draw_overlay_masks(
 def _draw_overlay(frame: np.ndarray, payload: dict) -> None:
     """Draw the overlay payload's boxes + captions on ``frame`` in place.
 
-    Mirrors :func:`_draw_detections` visually (same green palette and
-    label-clamp behaviour) but reads the styling from the payload's
-    ``style`` block so the workflow author's ``line_width`` /
-    ``font_scale`` choices in the ``annotate`` node actually take
-    effect at the driver. Coordinates in the payload are in the
-    original frame's pixel space; the driver clamps them to its own
-    encode resolution.
+    Mirrors :func:`_draw_detections` visually but reads styling from the
+    payload's ``style`` block. Per-box colour comes from the ``color`` field
+    that ``build_overlay_payload`` in the SDK pre-resolves from the chosen
+    palette — the driver has no palette knowledge and stays in sync with the
+    SDK automatically.
     """
     import cv2
 
@@ -584,8 +567,10 @@ def _draw_overlay(frame: np.ndarray, payload: dict) -> None:
         if x2 <= x1 or y2 <= y1:
             continue
 
+        color = _overlay_color_from_box(box)
+
         if line_width > 0:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), line_width)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, line_width)
 
         if font_scale <= 0:
             continue
@@ -609,7 +594,7 @@ def _draw_overlay(frame: np.ndarray, payload: dict) -> None:
             frame,
             (x1, bg_top),
             (x1 + text_w + 4, bg_bottom),
-            (0, 255, 0),
+            color,
             cv2.FILLED,
         )
         cv2.putText(
