@@ -53,6 +53,20 @@ Camera-specific metadata params (set on the twin / asset metadata):
                                (e.g. Intel RealSense). Defaults to false.
   metadata.video_device     – The /dev/video* device index or path to use.
                                Defaults to "0".
+  metadata.resolution       – Optional ``"WxH"`` (e.g. ``"256x192"``,
+                               ``"1920x1080"``) override for sensors whose
+                               native modes don't include the SDK's
+                               ``Resolution.VGA`` (640x480) default. When
+                               unset the SDK negotiates 640x480 via V4L2,
+                               which falls back to the camera's largest
+                               available mode if the request fails — fine
+                               for most webcams, but on entry-level thermal
+                               cameras (Topdon TC001 / InfiRay P2 Pro-class)
+                               this lands on a dual-frame 256x384 mode whose
+                               bottom half is raw thermal bytes (the
+                               green-bottom artifact). Pin this to a mode
+                               your sensor actually serves natively to skip
+                               the silent fallback.
 """
 
 import asyncio
@@ -158,6 +172,50 @@ def _parse_camera_id(video_device: str) -> int | str:
         return int(video_device)
     except ValueError:
         return video_device
+
+
+def _parse_resolution(value: str | None) -> tuple[int, int] | None:
+    """Parse a ``metadata.resolution`` string into a ``(width, height)`` tuple.
+
+    Accepts ``"WxH"`` (case-insensitive on the separator), e.g. ``"256x192"``,
+    ``"640X480"``, ``"1920x1080"``. Returns ``None`` for empty / unset / malformed
+    input so the caller can fall through to the SDK default.
+
+    This is the escape hatch for sensors whose advertised native modes don't
+    include the SDK's ``Resolution.VGA`` (640x480) default. Without it,
+    ``cv2.VideoCapture`` silently falls back to whatever the V4L2 backend
+    picks — typically the largest available mode — which on some thermal
+    cameras (Topdon TC001 / InfiRay P2 Pro-class) lands on a dual-frame
+    256x384 mode where the bottom 256x192 is raw thermal data exposed as
+    YUYV bytes (the green-bottom artifact). Pinning ``metadata.resolution``
+    to a mode the sensor actually serves natively avoids the fallback.
+    """
+    if not value:
+        return None
+    raw = value.strip().lower().replace(" ", "")
+    if "x" not in raw:
+        logger.warning(
+            "Ignoring CYBERWAVE_METADATA_RESOLUTION=%r: expected 'WxH' (e.g. '256x192')",
+            value,
+        )
+        return None
+    parts = raw.split("x", 1)
+    try:
+        width = int(parts[0])
+        height = int(parts[1])
+    except ValueError:
+        logger.warning(
+            "Ignoring CYBERWAVE_METADATA_RESOLUTION=%r: width/height must be integers",
+            value,
+        )
+        return None
+    if width <= 0 or height <= 0:
+        logger.warning(
+            "Ignoring CYBERWAVE_METADATA_RESOLUTION=%r: width and height must be positive",
+            value,
+        )
+        return None
+    return (width, height)
 
 
 class _FrameSlot:
@@ -770,12 +828,22 @@ async def main() -> None:
             camera_id,
         )
 
+    # Optional ``metadata.resolution`` override. When unset, the SDK uses its
+    # ``Resolution.VGA`` (640x480) default, which is fine for the vast majority
+    # of UVC webcams. Sensors that don't advertise 640x480 (e.g. entry-level
+    # thermal cameras whose only modes are 256x192 / 256x384) need this pinned
+    # to a native mode — see ``_parse_resolution`` for the rationale.
+    resolution_override = _parse_resolution(os.getenv("CYBERWAVE_METADATA_RESOLUTION"))
+
     logger.info(
-        "Initializing camera driver for twin %s (asset=%s, device=%s, camera_name=%s)",
+        "Initializing camera driver for twin %s (asset=%s, device=%s, camera_name=%s, resolution=%s)",
         twin_uuid,
         asset_key,
         camera_id,
         camera_name or "(from twin API default)",
+        f"{resolution_override[0]}x{resolution_override[1]}"
+        if resolution_override
+        else "(SDK default)",
     )
 
     client = Cyberwave(api_key=token, source_type="edge")
@@ -1128,16 +1196,24 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
+    # Build the kwargs dict once; only forward ``resolution`` when explicitly
+    # set so the SDK still applies its ``Resolution.VGA`` default otherwise.
+    # Forwarding ``resolution=None`` would short-circuit the default and trip
+    # the SDK's resolution parsing.
+    stream_kwargs: dict[str, object] = {
+        "camera_id": camera_id,
+        "camera_name": camera_name,
+        "fps": 30,
+        "frame_callback": frame_callback,
+    }
+    if resolution_override is not None:
+        stream_kwargs["resolution"] = resolution_override
+
     stream_started = False
     try:
         logger.info("Starting camera stream for twin %s...", twin_uuid)
         try:
-            await camera.stream_video_background(
-                camera_id=camera_id,
-                camera_name=camera_name,
-                fps=30,
-                frame_callback=frame_callback,
-            )
+            await camera.stream_video_background(**stream_kwargs)
             stream_started = True
         except Exception as stream_error:
             if not should_retry_camera_start(shutdown_requested):
@@ -1166,13 +1242,12 @@ async def main() -> None:
                 "Retrying camera stream using auto-detected fallback device '%s'",
                 fallback_camera_id,
             )
+            # Reuse the same kwargs as the primary attempt so the optional
+            # ``resolution`` override applies to the fallback too — same
+            # sensor class, same mode constraints.
+            fallback_kwargs = dict(stream_kwargs, camera_id=fallback_camera_id)
             try:
-                await camera.stream_video_background(
-                    camera_id=fallback_camera_id,
-                    camera_name=camera_name,
-                    fps=30,
-                    frame_callback=frame_callback,
-                )
+                await camera.stream_video_background(**fallback_kwargs)
                 stream_started = True
             except Exception as fallback_error:
                 raise HardwareConnectionError(
