@@ -101,10 +101,15 @@ except ImportError:
     FILTERED_FRAME_CHANNEL = "frames/filtered"
     FRAME_OVERLAY_CHANNEL = "frames/overlay"
 
+# Emit timestamps in UTC so driver logs line up with edge-core's logs when
+# forwarded into the same `cyberwave edge logs` stream (containers have no host
+# timezone mounted, so local time would otherwise drift from the host).
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S UTC",
 )
+logging.Formatter.converter = time.gmtime
 logger = logging.getLogger("camera-driver")
 HARDWARE_CONNECTION_EXIT_CODE = 66
 
