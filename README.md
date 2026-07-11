@@ -145,21 +145,36 @@ Injected by `cyberwave-edge-core` at runtime:
 | `CYBERWAVE_DETECTION_OVERLAYS`    | `true` (default) to draw YOLO bounding boxes from the `detections/*` Zenoh channel on the WebRTC stream. Set to `false` to disable. Ignored on depth cameras. |
 | `CYBERWAVE_METADATA_FRAME_FILTER_ENABLED` | `false` (default). Set to `true` to subscribe to the `frames/filtered` Zenoh channel and substitute worker-processed (e.g. anonymised/pixelated) frames into the WebRTC stream before encoding. When enabled, emits a black frame if no fresh processed frame is available — privacy-safe by default, no raw fallback. |
 | `CYBERWAVE_METADATA_FRAME_FILTER_FRESHNESS_MS` | Max age (ms) of a processed frame before it is treated as stale and replaced with a blank frame. Default: `200` (tuned for ≥ 5 Hz GPU workers). Raise to `400`–`500` for CPU-only workers; higher values keep more visibly-stale frames on screen and weaken the privacy contract. `0` is a valid "force blank" fail-close test mode. Only honoured when `CYBERWAVE_METADATA_FRAME_FILTER_ENABLED=true`. |
+| `CYBERWAVE_METADATA_DEPTH_FPS`    | Depth capture rate (default: `30`). Only read on twins with a `depth`-typed sensor; controls the publisher-thread budget log for the `depth/<sensor>` Zenoh channel. |
 | `CYBERWAVE_CAMERA_STRICT_GEOMETRY` | `false` (default). Set to `true` on edge images where you want a resolution mismatch (e.g. requested VGA but driver got 1080p because the camera fell back to its native format) to raise `RuntimeError` at startup rather than logging a `WARNING` and shipping a stream that is 50x over the bandwidth budget. |
 | `CYBERWAVE_CAMERA_SKIP_V4L2_CHECK` | `false` (default). Escape hatch for the Linux V4L2 build-info self-test in the SDK. Set to `true` to bypass the check; only useful if you are intentionally running on a Linux host with an OpenCV that lacks V4L2 and you understand the consequences (frames default to YUYV at the camera's native resolution). |
 
 ## Zenoh data bus
 
-When `CYBERWAVE_DATA_BACKEND=zenoh` (or `filesystem`) is set, this driver publishes sensor data to the local Zenoh data bus in addition to the WebRTC cloud path. The channel name is taken from the twin's asset schema so the sensor segment is meaningful (e.g. `color_camera`, `depth_camera`):
+When `CYBERWAVE_DATA_BACKEND=zenoh` (or `filesystem`) is set, this driver publishes sensor data to the local Zenoh data bus in addition to the WebRTC cloud path. Channel names are taken from the twin's asset schema so the sensor segment is meaningful (e.g. `color_camera`, `depth_camera`):
 
-| Channel                       | Payload                                    |
-| ----------------------------- | ------------------------------------------ |
-| `frames/<sensor>` (from asset) | Raw BGR uint8 frames via SDK binary header |
-| `frames/default` (legacy)     | Only when the twin's asset declares no camera sensor — the driver logs a warning pointing at the drift |
+| Channel                        | Payload                                                                     |
+| ------------------------------ | --------------------------------------------------------------------------- |
+| `frames/<sensor>` (from asset) | Raw BGR uint8 frames via SDK binary header (JPEG optional via env override) |
+| `frames/default` (legacy)      | Only when the twin's asset declares no camera sensor — the driver logs a warning pointing at the drift |
+| `depth/<sensor>` (from asset)  | Raw uint16 depth frames aligned to the color grid (RealSense / RGBD only)   |
 
 Worker containers can subscribe with `@cw.on_frame(twin_uuid)` (wildcard — matches any camera on the twin) or pin to a specific sensor via `@cw.on_frame(twin_uuid, sensor="color_camera")`. Use `cyberwave worker doctor` to verify that the expected subscription keys match what the driver actually publishes.
 
 Set `CYBERWAVE_PUBLISH_MODE` to control which paths are active (`dual`, `zenoh_only`, `mqtt_only`). Default is `dual`.
+
+### Depth streaming (RealSense / RGBD)
+
+On twins with `is_depth_camera: true` (or a sensor of `type: depth` in the asset schema) the driver enables the SDK's RealSense pipeline and starts a second Zenoh publisher for depth frames on `depth/<sensor>`. Depth is **always published raw** (uint16) — JPEG encoding is intentionally not offered because lossy compression corrupts millimeter values. The SDK applies `rs.align(rs.stream.color)` before the callback fires so consumers receive depth registered to the color grid; downstream primitives such as `object_pose` rely on this contract.
+
+Set `CYBERWAVE_METADATA_DEPTH_FPS` (default `30`) to match the camera's advertised depth mode. The value only affects the publisher-thread budget log line — the actual capture rate is negotiated inside the RealSense pipeline.
+
+**Consumer-side color+depth synchronization.** The two channels publish independently on separate publisher threads, so downstream subscribers that fuse color and depth (e.g. `object_pose`, tracking, sim-to-real) should reconcile using the `ts` and `seq` fields emitted by the SDK's binary header on every sample:
+
+- `ts` — wall-clock timestamp in seconds (float), stamped by the SDK header at **publish time** on each publisher thread. Both color and depth are dispatched from the same `recv()` call microseconds apart, but the actual `ts` values are set when each publisher thread wakes up and calls the backend; skew is bounded by scheduling latency and Zenoh publish overhead (typically sub-millisecond on the same host).
+- `seq` — per-channel monotonic frame counter (starts at 0).
+
+Recommended pairing strategy: keep a small (~1s) window of the last-seen depth frames keyed by `ts`, and on each color frame pop the depth entry with the closest `ts` (nearest-neighbour). A `abs(ts_color - ts_depth) < 5 ms` gate is a safe default at 30 fps; tighten to 2 ms if you observe clean pairings. Do **not** pair by `seq` alone — the two counters restart independently after reconnects, so `seq` is only monotone *within* a channel.
 
 ## Detection overlays
 

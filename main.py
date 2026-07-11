@@ -720,6 +720,23 @@ def _enforce_frame_filter_requires_data_bus(
     sys.exit(1)
 
 
+def _build_depth_stream_extras(
+    depth_fps: int,
+    depth_callback: object,
+) -> dict[str, object]:
+    """Extra ``stream_kwargs`` for RGBD (RealSense) twins.
+
+    Must NOT include ``camera_type`` or ``enable_depth``:
+    ``DepthCameraTwin.stream_video_background`` sets both, so a
+    collision on the inner ``client.video_stream(...)`` call would
+    raise ``TypeError`` at startup. Pinned by the test suite.
+    """
+    return {
+        "depth_fps": depth_fps,
+        "depth_callback": depth_callback,
+    }
+
+
 def _zenoh_publisher_thread(
     data_bus: object,
     slot: _FrameSlot,
@@ -817,11 +834,38 @@ async def main() -> None:
 
     sensors = (twin_data.get("capabilities") or {}).get("sensors") or []
     is_depth_camera = any(s.get("type") == "depth" for s in sensors)
+
+    def _first_sensor_id_by_type(wanted_type: str) -> str | None:
+        for entry in sensors:
+            if isinstance(entry, dict) and entry.get("type") == wanted_type:
+                sid = entry.get("id")
+                if sid is not None:
+                    return str(sid)
+        return None
+
+    # WebRTC / MQTT / color-Zenoh sensor identifier — "first sensor wins"
+    # preserves the pre-existing channel-name contract for RGB twins.
     camera_name: str | None = None
     if sensors and isinstance(sensors[0], dict):
         sid = sensors[0].get("id")
         if sid is not None:
             camera_name = str(sid)
+
+    # New (RealSense-only) channel — derived by type so downstream
+    # perception nodes can look up the right depth intrinsics from
+    # cw-driver.yml. No regression risk: the ``depth/<sensor>`` channel
+    # didn't exist before this change.
+    depth_sensor_name = _first_sensor_id_by_type("depth") or "default"
+
+    try:
+        depth_fps = int(os.getenv("CYBERWAVE_METADATA_DEPTH_FPS", "30"))
+    except ValueError:
+        logger.warning(
+            "Invalid CYBERWAVE_METADATA_DEPTH_FPS=%r; falling back to 30",
+            os.getenv("CYBERWAVE_METADATA_DEPTH_FPS"),
+        )
+        depth_fps = 30
+
     video_device = os.getenv("CYBERWAVE_METADATA_VIDEO_DEVICE", "0")
     camera_id = _parse_camera_id(video_device)
     if isinstance(camera_id, str) and camera_id.startswith("/dev/") and not os.path.exists(camera_id):
@@ -963,6 +1007,30 @@ async def main() -> None:
                 camera_channel,
                 frame_encoding,
             )
+
+    # ── Depth Zenoh publisher (RealSense twins only) ──
+    # Second single-slot buffer + publisher thread that streams the
+    # aligned depth frame on ``depth/<depth_sensor_name>``. Depth is
+    # always raw uint16 — JPEG would corrupt millimeter values.
+    depth_slot: _FrameSlot | None = None
+    stop_depth_publisher = threading.Event()
+    depth_publisher_thread: threading.Thread | None = None
+    if is_depth_camera and data_bus is not None:
+        depth_channel = f"depth/{depth_sensor_name}"
+        depth_slot = _FrameSlot()
+        depth_publisher_thread = threading.Thread(
+            target=_zenoh_publisher_thread,
+            args=(data_bus, depth_slot, stop_depth_publisher, depth_channel, depth_fps),
+            kwargs={"encoding": "raw"},
+            daemon=True,
+            name="zenoh-depth-publisher",
+        )
+        depth_publisher_thread.start()
+        logger.info(
+            "Zenoh depth publishing enabled on channel '%s' (fps=%d, encoding=raw)",
+            depth_channel,
+            depth_fps,
+        )
 
     # ── Detection overlay subscription ──
     # Subscribe to ``cw/<twin_uuid>/data/detections/**`` so ML workers
@@ -1188,6 +1256,14 @@ async def main() -> None:
 
     frame_callback = _on_frame if data_bus is not None else None
 
+    def _on_depth_frame(depth: np.ndarray, _frame_count: int) -> None:
+        # SDK already gave us a Python-owned copy; nobody mutates depth,
+        # so no defensive copy needed before staging.
+        if depth_slot is not None:
+            depth_slot.put(depth)
+
+    depth_callback = _on_depth_frame if depth_slot is not None else None
+
     stop_event = asyncio.Event()
     shutdown_requested = False
 
@@ -1213,6 +1289,12 @@ async def main() -> None:
     }
     if resolution_override is not None:
         stream_kwargs["resolution"] = resolution_override
+
+    # DepthCameraTwin.stream_video_background already hardcodes
+    # ``camera_type="realsense"`` and ``enable_depth=True``; we only add
+    # what the SDK doesn't set. See ``_build_depth_stream_extras``.
+    if is_depth_camera:
+        stream_kwargs.update(_build_depth_stream_extras(depth_fps, depth_callback))
 
     stream_started = False
     try:
@@ -1296,6 +1378,9 @@ async def main() -> None:
         stop_publisher.set()
         if publisher_thread is not None:
             publisher_thread.join(timeout=5.0)
+        stop_depth_publisher.set()
+        if depth_publisher_thread is not None:
+            depth_publisher_thread.join(timeout=5.0)
         if stream_started:
             try:
                 await camera.stop_streaming()
