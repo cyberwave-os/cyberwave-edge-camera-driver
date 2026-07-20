@@ -78,6 +78,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from cyberwave import Cyberwave
@@ -737,6 +738,26 @@ def _build_depth_stream_extras(
     }
 
 
+def _time_reference_update_thread(
+    time_reference: Any, stop: threading.Event
+) -> None:
+    """Keep the SDK's shared ``TimeReference`` fresh at ~100 Hz.
+
+    ``client.video_stream`` defaults camera tracks to the client's shared
+    ``TimeReference``, whose ``read()`` returns the last ``update()`` snapshot.
+    Robot drivers refresh it from their control loop; this camera-only driver
+    has no control loop, so without this thread every frame (video sync
+    anchors AND MQTT depth frames) is stamped with the same frozen
+    client-init timestamp, which collapses backend pointcloud recordings to a
+    single frame. The SDK is deliberately untouched: drivers that already
+    update the reference are unaffected (update() is a lock-guarded
+    set-to-now, safe with multiple writers).
+    """
+    while not stop.is_set():
+        time_reference.update()
+        stop.wait(0.01)
+
+
 def _zenoh_publisher_thread(
     data_bus: object,
     slot: _FrameSlot,
@@ -897,6 +918,23 @@ async def main() -> None:
 
     client = Cyberwave(api_key=token, source_type="edge")
     camera = client.twin(asset_key=asset_key, twin_id=twin_uuid)
+
+    # Keep the shared TimeReference fresh — see _time_reference_update_thread.
+    # Guarded on presence: the real client always exposes ``time_reference``,
+    # but test doubles / minimal clients may not, and the keepalive is an
+    # enhancement, not a hard dependency (missing it degrades to the SDK's
+    # per-capture fallback, never a crash).
+    stop_timeref = threading.Event()
+    timeref_thread: threading.Thread | None = None
+    time_reference = getattr(client, "time_reference", None)
+    if time_reference is not None:
+        timeref_thread = threading.Thread(
+            target=_time_reference_update_thread,
+            args=(time_reference, stop_timeref),
+            daemon=True,
+            name="timeref-update",
+        )
+        timeref_thread.start()
 
     # ── Zenoh data bus initialization ──
     data_bus = None
@@ -1386,6 +1424,9 @@ async def main() -> None:
                 await camera.stop_streaming()
             except Exception:
                 logger.exception("Failed while stopping camera stream")
+        stop_timeref.set()
+        if timeref_thread is not None:
+            timeref_thread.join(timeout=2.0)
         client.disconnect()
         logger.info("Camera driver stopped.")
 
