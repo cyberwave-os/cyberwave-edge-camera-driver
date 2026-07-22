@@ -130,6 +130,21 @@ Then reference the RealSense image in your asset metadata:
 }
 ```
 
+## Hardware-accelerated H264 encoding
+
+The driver auto-detects a hardware H264 encoder at stream start and falls
+back to software (libx264) when none is usable.
+
+- **Raspberry Pi 4**: pass the V4L2 encoder device into the container:
+  `--device /dev/video11` (alongside your camera device). Pi 5 has no H264
+  encode hardware; software encoding is used automatically.
+- **Pin or disable** with `CYBERWAVE_VIDEO_ENCODER`:
+  `auto` (default), a specific encoder (e.g. `h264_v4l2m2m`), or `libx264`
+  to force software encoding.
+
+The active encoder is visible in the stream attributes of the WebRTC offer
+(`video_encoder`).
+
 ## Environment variables
 
 Injected by `cyberwave-edge-core` at runtime:
@@ -148,6 +163,7 @@ Injected by `cyberwave-edge-core` at runtime:
 | `CYBERWAVE_METADATA_DEPTH_FPS`    | Depth capture rate (default: `30`). Only read on twins with a `depth`-typed sensor; controls the publisher-thread budget log for the `depth/<sensor>` Zenoh channel. |
 | `CYBERWAVE_CAMERA_STRICT_GEOMETRY` | `false` (default). Set to `true` on edge images where you want a resolution mismatch (e.g. requested VGA but driver got 1080p because the camera fell back to its native format) to raise `RuntimeError` at startup rather than logging a `WARNING` and shipping a stream that is 50x over the bandwidth budget. |
 | `CYBERWAVE_CAMERA_SKIP_V4L2_CHECK` | `false` (default). Escape hatch for the Linux V4L2 build-info self-test in the SDK. Set to `true` to bypass the check; only useful if you are intentionally running on a Linux host with an OpenCV that lacks V4L2 and you understand the consequences (frames default to YUYV at the camera's native resolution). |
+| `CYBERWAVE_VIDEO_ENCODER`         | `auto` (default) probes for a usable hardware H264 encoder (e.g. `h264_v4l2m2m` on Raspberry Pi 4 with `/dev/video11` passed through) and falls back to `libx264` if none is usable. Set to a specific encoder name to pin it, or `libx264` to force software encoding. |
 
 ## Zenoh data bus
 

@@ -121,6 +121,13 @@ RUN python3 -c "import cv2, re; info = cv2.getBuildInformation(); \
         'Runtime cv2 lost V4L2 backend after install:\n' + info; \
     print('Runtime cv2 ready at', cv2.__file__)"
 
+# The SDK's hardware H264 auto-probe (CYBERWAVE_VIDEO_ENCODER=auto) relies on
+# the PyPI av wheel shipping the V4L2 M2M encoder (present since av 12.x
+# manylinux builds). Fail the build if a future wheel drops it rather than
+# silently regressing every Raspberry Pi 4 back to software encoding.
+RUN python3 -c "from av.codec import Codec; Codec('h264_v4l2m2m', 'w'); \
+    print('av h264_v4l2m2m encoder present')"
+
 RUN python3 -c "import main; print('Camera driver application import OK')"
 
 RUN mkdir -p /app/.cyberwave
