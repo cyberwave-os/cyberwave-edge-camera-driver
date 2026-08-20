@@ -854,7 +854,21 @@ async def main() -> None:
         raise ValueError("No sensors found in twin JSON")
 
     sensors = (twin_data.get("capabilities") or {}).get("sensors") or []
+    # The asset's declared sensors are the default source of truth, but
+    # ``metadata.is_depth_camera`` (documented in the README) wins when set
+    # explicitly. This decouples the *capture backend* from the *twin shape*:
+    # an RGBD-shaped twin can be fed by a plain UVC device whose depth stream
+    # this driver has no backend for (e.g. an Orbbec, where only the color
+    # node is V4L2-accessible and depth needs the Orbbec SDK, not librealsense).
     is_depth_camera = any(s.get("type") == "depth" for s in sensors)
+    _depth_override = os.getenv("CYBERWAVE_METADATA_IS_DEPTH_CAMERA")
+    if _depth_override is not None and _depth_override.strip() != "":
+        is_depth_camera = _depth_override.strip().lower() in ("1", "true", "yes", "on")
+        logger.info(
+            "metadata.is_depth_camera=%r overrides sensor-derived depth mode -> is_depth_camera=%s",
+            _depth_override,
+            is_depth_camera,
+        )
 
     def _first_sensor_id_by_type(wanted_type: str) -> str | None:
         for entry in sensors:
