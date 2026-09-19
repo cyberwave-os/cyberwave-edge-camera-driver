@@ -73,6 +73,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -171,13 +172,140 @@ def _list_cameras() -> tuple[list[str], list[str]]:
 
 
 def _parse_camera_id(video_device: str) -> int | str:
-    """Parse camera metadata into SDK-compatible camera_id."""
-    # Numeric values from metadata should be treated as local camera indices.
-    # Non-numeric values can be /dev/video* paths, RTSP URLs, etc.
+    """Parse camera metadata into SDK-compatible camera_id.
+
+    Numeric values are local camera indices; everything else (``/dev/video*``
+    paths, ``/dev/v4l/by-id`` paths, RTSP/HTTP URLs) passes through.
+
+    Never call this on a hardware serial: serials are all-digit strings, so
+    ``int()`` accepts them and silently strips leading zeros. Serials arrive
+    via ``metadata.serial_number`` and are routed by
+    :func:`_resolve_camera_source` instead.
+    """
     try:
         return int(video_device)
     except ValueError:
         return video_device
+
+
+_V4L_BY_ID_DIR = "/dev/v4l/by-id"
+_V4L_BY_PATH_DIR = "/dev/v4l/by-path"
+
+
+def _is_stable_device_identifier(camera_id: int | str) -> bool:
+    """True when *camera_id* names one specific physical device.
+
+    The distinction decides whether auto-detect may substitute a different
+    camera after a failed start:
+
+    - **Positional** (substitutable): an OpenCV index, or a ``/dev/videoN``
+      node. Neither names a unit — ``/dev/video2`` is "whatever enumerated
+      second", and that moves on replug — so re-discovering one matches the
+      caller's intent.
+    - **Stable** (not substitutable): ``/dev/v4l/by-id`` and ``by-path``
+      entries (they embed serial / USB topology), RTSP-HTTP URLs, and
+      RealSense serials. Swapping any of these streams different footage
+      under the twin's identity.
+    """
+    if not isinstance(camera_id, str):
+        return False
+    if camera_id.startswith((_V4L_BY_ID_DIR, _V4L_BY_PATH_DIR)):
+        return True
+    if camera_id.startswith("/dev/"):
+        return False
+    return True
+
+
+def _resolve_uvc_serial(serial: str, by_id_dir: str = _V4L_BY_ID_DIR) -> str | None:
+    """Return the ``/dev/v4l/by-id`` path for a UVC camera with *serial*.
+
+    ``by-id`` names embed vendor, product and serial, e.g.
+    ``usb-046d_HD_Pro_Webcam_C920_ABC123-video-index0``. Matching on the
+    delimited serial field gives a handle that survives replug, unlike
+    ``/dev/videoN`` numbering. A bare substring is unsafe because ``ABC123``
+    also appears in ``ABC1234`` and a serial can equal a product-name token.
+
+    Returns the first ``video-index0`` entry (the capture node; higher
+    indices are metadata/IR siblings), or ``None`` when nothing matches.
+    """
+    try:
+        entries = sorted(os.listdir(by_id_dir))
+    except OSError:
+        logger.debug("No %s directory; cannot resolve UVC serial", by_id_dir)
+        return None
+
+    serial_entry = re.compile(rf"_{re.escape(serial)}-video-index\d+$")
+    matches = [entry for entry in entries if serial_entry.search(entry)]
+    for entry in matches:
+        if entry.endswith("video-index0"):
+            return os.path.join(by_id_dir, entry)
+    if not matches:
+        return None
+    return os.path.join(by_id_dir, matches[0])
+
+
+def _missing_camera_device_message(*, device_pinned: bool) -> str:
+    """Describe the recovery behavior used by the stream-start error path."""
+    if device_pinned:
+        return (
+            "it names one specific camera, so the driver will fail rather than "
+            "substitute another; check that the device is passed through to this "
+            "container"
+        )
+    return "will attempt auto-discovery fallback if stream start fails"
+
+
+def _resolve_camera_source(
+    *,
+    serial_env: str | None,
+    video_device_env: str | None,
+    is_depth_camera: bool,
+) -> tuple[int | str, str | None, bool]:
+    """Resolve twin metadata into the source the SDK should open.
+
+    Returns ``(camera_id, serial_number, pinned)``:
+
+    - ``camera_id`` — what a V4L2/OpenCV capture opens. Unused on the depth
+      path, where librealsense addresses the device by serial instead.
+    - ``serial_number`` — the RealSense serial to pin via
+      ``config.enable_device()``, or ``None``.
+    - ``pinned`` — the configuration names one specific physical device, so
+      auto-detect must not substitute a different camera when the stream
+      fails to start. See :func:`_is_stable_device_identifier`.
+
+    A serial only ever comes from ``metadata.serial_number``. ``video_device``
+    is always a *source* — an index, a device path, or a URL — never a serial:
+    the two are indistinguishable by shape, and before ``serial_number``
+    existed a serial placed in ``video_device`` was forwarded to the SDK and
+    silently dropped for RealSense, so no twin's serial was ever honoured
+    through that field.
+    """
+    serial = (serial_env or "").strip() or None
+    raw_device = (video_device_env or "").strip() or None
+
+    if is_depth_camera:
+        # librealsense owns the USB device and exposes no V4L2 path to hand a
+        # pipeline, so the serial travels separately and camera_id is inert.
+        return (_parse_camera_id(raw_device) if raw_device else 0), serial, serial is not None
+
+    if serial:
+        # UVC cameras are reachable by path, so a serial resolves to the
+        # stable ``/dev/v4l/by-id`` node rather than an unstable index.
+        resolved = _resolve_uvc_serial(serial, _V4L_BY_ID_DIR)
+        if resolved is None:
+            raise HardwareConnectionError(
+                f"No UVC camera with serial '{serial}' under "
+                f"{_V4L_BY_ID_DIR}. Check the serial, and that the device is "
+                "attached and visible to this container."
+            )
+        logger.info("Resolved serial %s -> %s", serial, resolved)
+        return resolved, None, True
+
+    if raw_device is None:
+        return 0, None, False
+
+    camera_id = _parse_camera_id(raw_device)
+    return camera_id, None, _is_stable_device_identifier(camera_id)
 
 
 def _parse_resolution(value: str | None) -> tuple[int, int] | None:
@@ -901,15 +1029,20 @@ async def main() -> None:
         )
         depth_fps = 30
 
-    video_device = os.getenv("CYBERWAVE_METADATA_VIDEO_DEVICE", "0")
-    camera_id = _parse_camera_id(video_device)
+    # ``serial_number`` answers "which physical unit"; ``video_device`` answers
+    # "what source to open". Two units of the same model defeat name matching
+    # and OS device indices shift on replug, so the serial is the only stable
+    # handle — and it is device-class agnostic, unlike the video-specific field.
+    camera_id, serial_number, device_pinned = _resolve_camera_source(
+        serial_env=os.getenv("CYBERWAVE_METADATA_SERIAL_NUMBER"),
+        video_device_env=os.getenv("CYBERWAVE_METADATA_VIDEO_DEVICE"),
+        is_depth_camera=is_depth_camera,
+    )
     if isinstance(camera_id, str) and camera_id.startswith("/dev/") and not os.path.exists(camera_id):
         logger.warning(
-            (
-                "Configured camera device '%s' does not exist inside the container; "
-                "will attempt auto-discovery fallback if stream start fails"
-            ),
+            "Configured camera device '%s' does not exist inside the container; %s",
             camera_id,
+            _missing_camera_device_message(device_pinned=device_pinned),
         )
 
     # Optional ``metadata.resolution`` override. When unset, the SDK uses its
@@ -1341,6 +1474,10 @@ async def main() -> None:
     }
     if resolution_override is not None:
         stream_kwargs["resolution"] = resolution_override
+    # Travels as its own field rather than smuggled through ``camera_id``: a
+    # serial is hardware identity, an index/path is a source to open.
+    if serial_number is not None:
+        stream_kwargs["serial_number"] = serial_number
 
     # DepthCameraTwin.stream_video_background already hardcodes
     # ``camera_type="realsense"`` and ``enable_depth=True``; we only add
@@ -1364,6 +1501,19 @@ async def main() -> None:
                 "Camera stream failed with configured device '%s', trying auto-detect fallback",
                 camera_id,
             )
+            # Substituting a different camera for a pinned one streams the
+            # wrong footage under this twin's identity — an IP-camera twin
+            # quietly serving a local webcam, or a depth twin binding the
+            # device another twin already holds. That is worse than failing.
+            if device_pinned:
+                raise HardwareConnectionError(
+                    f"Configured device '{serial_number or camera_id}' could not be opened. Not "
+                    "falling back to auto-detect: it names a specific camera, "
+                    "so any substitute would stream different footage under "
+                    "this twin. Verify the value is correct and that no other "
+                    "driver already holds the device."
+                ) from stream_error
+
             cv2_cameras, realsense_cameras = _list_cameras()
             fallback_candidates = realsense_cameras if is_depth_camera else cv2_cameras
             if not fallback_candidates:

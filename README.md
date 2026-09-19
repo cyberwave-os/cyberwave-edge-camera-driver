@@ -48,13 +48,16 @@ Set the following fields in the twin or asset metadata to configure the driver:
 | Field             | Type    | Default | Description                                                       |
 | ----------------- | ------- | ------- | ----------------------------------------------------------------- |
 | `is_depth_camera` | boolean | `false` | Set to `true` for RGBD/depth cameras (e.g. Intel RealSense D455). |
+| `serial_number`   | string  | unset   | Hardware serial of the camera to bind to. Required when the host has two units of the same model. Resolved via librealsense for depth cameras, `/dev/v4l/by-id` for UVC. |
 | `video_device`    | string  | `"0"`   | Capture source — see [Video source formats](#video-source-cyberwave_metadata_video_device) below. |
 
 ## Video source (`CYBERWAVE_METADATA_VIDEO_DEVICE`)
 
 The driver opens whatever string is in `CYBERWAVE_METADATA_VIDEO_DEVICE` (from twin
 `metadata.video_device`, expanded by `entrypoint.sh`, or injected by edge-core).
-This is the **only** field that selects which camera to stream.
+It selects **what source to open**; `serial_number` selects **which physical
+unit** and wins when both are set — see
+[Pinning a specific camera](#pinning-a-specific-camera).
 
 | Format | Example | Notes |
 | --- | --- | --- |
@@ -62,11 +65,68 @@ This is the **only** field that selects which camera to stream.
 | Device path | `"/dev/video2"` | Linux V4L2 device node. |
 | RTSP URL | `rtsp://user:pass@192.168.1.50:554/stream1` | IP cameras (Tapo, NVR channels, …). Uses OpenCV/FFmpeg with **TCP** transport. Credentials in the URL are optional; they are masked in edge-health telemetry. |
 | HTTP(S) URL | `http://192.168.1.50/snapshot.jpg` | Snapshot or MJPEG-over-HTTP sources. |
-| RealSense serial | `"123456789012"` | With `is_depth_camera: true` / `CYBERWAVE_METADATA_IS_DEPTH_CAMERA=true`. |
+| RealSense serial | `"123456789012"` | **Not supported here — use `serial_number`.** A serial in this field is treated as a source, not a unit, and is ignored by the RealSense path (it always was: before `serial_number` existed the value was forwarded to the SDK and dropped, so the camera was picked by enumeration order). Move it to `serial_number`. |
 
 RTSP and HTTP sources do **not** use `/dev/video*`. If the container env shows
 `/dev/video0` for an IP-camera twin, edge-core has applied the wrong source — see
 below.
+
+### Multiple RealSense cameras on one host
+
+Each twin must name its camera by serial, or both twins open the same device
+and the second fails with `Device or resource busy`. List the serials with:
+
+```bash
+python3 -c "import pyrealsense2 as rs; [print(d.get_info(rs.camera_info.serial_number)) for d in rs.context().devices]"
+```
+
+Then set each twin's metadata:
+
+```json
+{
+  "serial_number": "046322252081",
+  "is_depth_camera": true
+}
+```
+
+Keep `serial_number` a **JSON string**. Serials commonly start with a zero,
+which a JSON number would drop.
+
+See [Pinning a specific camera](#pinning-a-specific-camera) for why the driver
+will not silently substitute a different device.
+
+Which serial is physically left or right is not discoverable from software.
+Cover one lens and confirm the expected twin goes dark before relying on it.
+
+### Pinning a specific camera
+
+`video_device` accepts two kinds of value, and they behave differently on
+failure:
+
+| Kind | Examples | On failure |
+| ---- | -------- | ---------- |
+| **Stable identifier** — names one physical device | `serial_number`, `/dev/v4l/by-id/usb-...`, `/dev/v4l/by-path/...`, `rtsp://...` | Driver fails with a clear error |
+| **Positional index** — whatever is enumerated there now | `"0"`, `"2"`, `/dev/video0` | Driver auto-detects a replacement |
+
+The driver never substitutes a different camera for a stable identifier. Doing
+so would stream the wrong footage under the twin's identity — an IP-camera twin
+quietly serving a local webcam, or a depth twin binding the device another twin
+already holds. Auto-detect remains the default for twins that pin nothing.
+
+For USB cameras, prefer a `by-id` path over an index: `/dev/video*` numbering
+shifts when devices are replugged, while `by-id` encodes vendor, product and
+serial. On Linux, edge-core automatically mounts the host's `/dev/v4l` tree
+read-only into camera-driver containers when it exists. For a custom Docker
+launch, pass both the capture node and the stable-name tree, for example
+`--device /dev/video0:/dev/video0 -v /dev/v4l:/dev/v4l:ro`.
+
+```bash
+ls -l /dev/v4l/by-id/
+```
+
+```json
+{ "video_device": "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_ABC123-video-index0" }
+```
 
 ### IP / RTSP camera example
 
