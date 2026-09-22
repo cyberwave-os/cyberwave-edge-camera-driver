@@ -48,7 +48,7 @@ Set the following fields in the twin or asset metadata to configure the driver:
 | Field             | Type    | Default | Description                                                       |
 | ----------------- | ------- | ------- | ----------------------------------------------------------------- |
 | `is_depth_camera` | boolean | `false` | Set to `true` for RGBD/depth cameras (e.g. Intel RealSense D455). |
-| `serial_number`   | string  | unset   | Hardware serial of the camera to bind to. Required when the host has two units of the same model. Resolved via librealsense for depth cameras, `/dev/v4l/by-id` for UVC. |
+| `serial_number`   | string  | unset   | Hardware serial of the camera to bind to. Required when the host has two units of the same model. Resolved via librealsense for depth cameras (either the librealsense serial or the USB serial shown by `v4l2-ctl` and `cyberwave edge install` works), `/dev/v4l/by-id` for UVC. |
 | `video_device`    | string  | `"0"`   | Capture source — see [Video source formats](#video-source-cyberwave_metadata_video_device) below. |
 
 ## Video source (`CYBERWAVE_METADATA_VIDEO_DEVICE`)
@@ -79,6 +79,9 @@ and the second fails with `Device or resource busy`. List the serials with:
 ```bash
 python3 -c "import pyrealsense2 as rs; [print(d.get_info(rs.camera_info.serial_number)) for d in rs.context().devices]"
 ```
+
+A RealSense also has a different USB serial, which is what `v4l2-ctl` and the
+`cyberwave edge install` camera menu show. Either one works in `serial_number`.
 
 Then set each twin's metadata:
 

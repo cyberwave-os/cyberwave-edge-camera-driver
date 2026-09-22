@@ -190,6 +190,25 @@ def _parse_camera_id(video_device: str) -> int | str:
 
 _V4L_BY_ID_DIR = "/dev/v4l/by-id"
 _V4L_BY_PATH_DIR = "/dev/v4l/by-path"
+# Sensor ``type`` values that mean "this twin has a depth stream". Kept in sync
+# with the CLI installer's ``_DEPTH_SENSOR_TYPES``, which decides whether to
+# prompt an operator for a device or defer to this driver's serial handling.
+_DEPTH_SENSOR_TYPES = frozenset({"depth", "depth_camera"})
+
+
+def _sensors_declare_depth(sensors: list[dict]) -> bool:
+    """True when any declared sensor is a depth stream.
+
+    Both spellings count: ``capabilities`` types a depth sensor ``depth`` (with
+    ``depth_camera`` as the sensor *id*), while an asset's ``universal_schema``
+    types it ``depth_camera``. The CLI installer matches both when deciding
+    whether to prompt for a device, so matching only one here made the two
+    disagree about the same twin.
+    """
+    return any(
+        isinstance(sensor, dict) and sensor.get("type") in _DEPTH_SENSOR_TYPES
+        for sensor in sensors
+    )
 
 
 def _is_stable_device_identifier(camera_id: int | str) -> bool:
@@ -988,7 +1007,12 @@ async def main() -> None:
     # an RGBD-shaped twin can be fed by a plain UVC device whose depth stream
     # this driver has no backend for (e.g. an Orbbec, where only the color
     # node is V4L2-accessible and depth needs the Orbbec SDK, not librealsense).
-    is_depth_camera = any(s.get("type") == "depth" for s in sensors)
+    # Matching only ``depth`` classified an RGBD twin whose schema uses the
+    # ``depth_camera`` spelling (e.g. the Kinova Gen3 Vision) as a plain UVC
+    # camera, so its librealsense serial was sent down the
+    # ``_resolve_uvc_serial`` path and the driver refused to start.
+    # ``metadata.is_depth_camera`` still overrides both below.
+    is_depth_camera = _sensors_declare_depth(sensors)
     _depth_override = os.getenv("CYBERWAVE_METADATA_IS_DEPTH_CAMERA")
     if _depth_override is not None and _depth_override.strip() != "":
         is_depth_camera = _depth_override.strip().lower() in ("1", "true", "yes", "on")

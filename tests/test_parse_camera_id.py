@@ -235,3 +235,33 @@ class TestMissingCameraDeviceMessage:
     def test_positional_device_keeps_fallback_message(self) -> None:
         message = main._missing_camera_device_message(device_pinned=False)
         assert message == "will attempt auto-discovery fallback if stream start fails"
+
+
+class TestSensorsDeclareDepth:
+    """``_sensors_declare_depth`` must accept both depth vocabularies.
+
+    The CLI installer matches ``{"depth", "depth_camera"}`` when deciding
+    whether a twin's serial is verifiable on the host. When this side matched
+    only ``"depth"``, an RGBD twin declared with the other spelling was routed
+    to ``_resolve_uvc_serial``, which cannot resolve a librealsense serial, and
+    the driver raised rather than starting.
+    """
+
+    def test_capabilities_spelling_is_depth(self):
+        assert main._sensors_declare_depth([{"id": "depth_camera", "type": "depth"}])
+
+    def test_universal_schema_spelling_is_depth(self):
+        assert main._sensors_declare_depth([{"type": "depth_camera"}])
+
+    def test_rgb_only_twin_is_not_depth(self):
+        assert not main._sensors_declare_depth(
+            [{"id": "cam0", "type": "rgb"}, {"type": "camera"}]
+        )
+
+    def test_mixed_sensor_list_is_depth(self):
+        assert main._sensors_declare_depth(
+            [{"type": "rgb"}, {"type": "depth_camera"}]
+        )
+
+    def test_malformed_entries_do_not_crash(self):
+        assert not main._sensors_declare_depth([None, "depth", 42])
