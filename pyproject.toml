@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cyberwave-edge-camera-driver"
-version = "0.3.2"
+version = "0.3.3"
 description = "Cyberwave Edge Camera Driver for streaming camera feeds"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -38,7 +38,7 @@ dependencies = [
     # the opencv-python wheel pulled by [camera] because the container uses
     # apt's V4L2-enabled python3-opencv. [zenoh] is required for the same-host
     # frame bus (CYB-1998).
-    "cyberwave[camera,zenoh]>=0.5.0",
+    "cyberwave[camera,zenoh]>=0.7.2",
     # NumPy 1.x for binary compatibility with Debian's ``python3-opencv``
     # 4.6.0, which is the cv2 binding we install via apt (see Dockerfile).
     # Without this cap, pip resolves the SDK's ``numpy>=1.26`` to the latest

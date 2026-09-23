@@ -123,6 +123,14 @@ read-only into camera-driver containers when it exists. For a custom Docker
 launch, pass both the capture node and the stable-name tree, for example
 `--device /dev/video0:/dev/video0 -v /dev/v4l:/dev/v4l:ro`.
 
+Two exceptions apply to a USB camera's `serial_number`:
+
+- If `/dev/v4l/by-id` is not visible in the container (older edge-core
+  releases don't mount it), the driver logs a warning, ignores the serial and
+  uses `video_device` or auto-detect. Upgrade edge-core to get serial pinning.
+- A stream URL in `video_device` (`rtsp://...`, `http://...`, including the
+  macOS camera bridge) always takes precedence over `serial_number`.
+
 ```bash
 ls -l /dev/v4l/by-id/
 ```

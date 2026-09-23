@@ -307,7 +307,25 @@ def _resolve_camera_source(
         # pipeline, so the serial travels separately and camera_id is inert.
         return (_parse_camera_id(raw_device) if raw_device else 0), serial, serial is not None
 
-    if serial:
+    # A stream URL is an explicit source that outranks the serial. Edge-core
+    # injects the MJPEG bridge URL as ``video_device`` on macOS, where the
+    # Docker VM has no ``/dev/v4l`` at all, and a serial recorded on a Linux
+    # host rides along on the shared twin; an RTSP twin is the same case.
+    is_stream_url = raw_device is not None and "://" in raw_device
+
+    if serial and not is_stream_url and not os.path.isdir(_V4L_BY_ID_DIR):
+        # Edge-core releases before the ``/dev/v4l`` bind mount run this
+        # container ``--privileged``, which copies device nodes but not udev's
+        # by-id symlinks. Keep the pre-serial behaviour rather than crash-loop.
+        logger.warning(
+            "%s is not visible in this container (edge-core predates the "
+            "/dev/v4l mount); ignoring serial %s and using video_device",
+            _V4L_BY_ID_DIR,
+            serial,
+        )
+        serial = None
+
+    if serial and not is_stream_url:
         # UVC cameras are reachable by path, so a serial resolves to the
         # stable ``/dev/v4l/by-id`` node rather than an unstable index.
         resolved = _resolve_uvc_serial(serial, _V4L_BY_ID_DIR)

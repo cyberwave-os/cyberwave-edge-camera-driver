@@ -143,6 +143,40 @@ class TestResolveCameraSourceUvc:
         with pytest.raises(main.HardwareConnectionError, match="NOPE"):
             self._resolve(serial_env="NOPE")
 
+    @pytest.mark.parametrize(
+        ("video_device", "expected"),
+        [("/dev/video2", ("/dev/video2", None, False)), (None, (0, None, False))],
+    )
+    def test_serial_without_by_id_dir_falls_back_to_video_device(
+        self, video_device, expected, tmp_path, monkeypatch
+    ) -> None:
+        """Older edge-core never mounts ``/dev/v4l``: a serial persisted by a
+        newer CLI must not crash-loop a camera that streamed before."""
+        monkeypatch.setattr(main, "_V4L_BY_ID_DIR", str(tmp_path / "missing"))
+        assert (
+            self._resolve(serial_env="ABC123", video_device_env=video_device)
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        ["http://host.docker.internal:8554/cam", "rtsp://10.0.0.2/avc"],
+    )
+    def test_serial_does_not_override_stream_url(
+        self, url, tmp_path, monkeypatch
+    ) -> None:
+        """macOS gets its MJPEG bridge URL injected as ``video_device``; the
+        twin's serial (recorded on a Linux host) must not win over it, even
+        where ``by-id`` exists but holds no match."""
+        by_id = tmp_path / "by-id"
+        by_id.mkdir()
+        monkeypatch.setattr(main, "_V4L_BY_ID_DIR", str(by_id))
+        assert self._resolve(serial_env="ABC123", video_device_env=url) == (
+            url,
+            None,
+            True,
+        )
+
 
 class TestResolveUvcSerial:
     """``serial_number`` -> stable ``/dev/v4l/by-id`` path for UVC cameras."""
