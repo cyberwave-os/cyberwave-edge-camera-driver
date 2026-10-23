@@ -100,17 +100,15 @@ COPY LICENSE .
 # docker build). An empty sdk-local/ directory is used in production builds so
 # this step is a no-op.
 COPY sdk-local /tmp/sdk-local
+# Remove the conflicting PyPI OpenCV wheels in the installation layer so
+# their bytes are not retained in a lower image layer. The apt-built cv2
+# remains available with the V4L2 backend required by USB cameras.
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ -f "/tmp/sdk-local/pyproject.toml" ]; then \
         pip install "/tmp/sdk-local[camera,zenoh]"; \
     fi && \
-    pip install .
-
-# The [camera] extra pulls in opencv-python from PyPI. We want the apt-built
-# python3-opencv (with V4L2) to be the cv2 that gets imported, so uninstall
-# the PyPI wheel. The apt package lives at /usr/lib/python3/dist-packages
-# and is owned by dpkg, so pip uninstall only removes the conflicting copy.
-RUN pip uninstall -y opencv-python opencv-python-headless 2>/dev/null || true
+    pip install . && \
+    pip uninstall -y opencv-python opencv-python-headless
 
 # Final post-install assertion: cv2 still imports and still carries V4L2.
 # Without this, a future SDK change that re-pulls opencv-python (e.g. via a
